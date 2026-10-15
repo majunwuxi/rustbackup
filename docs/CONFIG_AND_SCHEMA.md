@@ -21,9 +21,12 @@
 - `*.tmp` 和 `~$*` 匹配每层文件名；`.git` 和 `node_modules` 为目录组件精确匹配并剪枝，case insensitive；规则改变只重新扫描，不自动清理旧备份。
 
 ## SQLite 迁移
-见 `sql/001_init.sql`；正式代码使用嵌入式版本化迁移。关键不变量：
+`sql/001_init.sql` 初始化 schema v1，`sql/002_history.sql` 将现有数据库升级到 v2；代码按 `PRAGMA user_version` 顺序执行嵌入式迁移。关键不变量：
 - `files` 唯一 `(task_id,relative_path_key)`；key 需规范化 Windows 不区分大小写，保留 display path。
 - `file_versions` 可恢复状态和存储引用；保留最新有效版本。
+- `history_objects` 以 BLAKE3 内容哈希寻址，manifest 记录每个文件版本的安全相对路径；只有对象写入、flush 和哈希/大小校验完成后，manifest 与版本才会转为 `recoverable`。
+- `history_object_refs` 明确连接 manifest 和内容对象；GC 只处理超过任务保留期的非最新版本。对象仍被其他有效版本引用时只移除过期 manifest，不删除对象；进行中的恢复通过 `restore_audit.status='running'` 阻止清理。
+- `restore_audit` 记录版本、目标目录、覆盖确认、开始/完成状态和错误摘要；进程重启时未完成恢复改为失败，之后才可重新参与 GC。
 - `transfer_jobs` 每个 `(task_id, relative_path_key, source_revision, destination)` 应幂等；旧 revision 不覆盖新 revision。
 - `destination_states` 各目标拥有自己提交的 revision 与远端 ID；禁止使用整任务一个 bool 表示已备份。
 - `backup_runs` 记录扫描/备份统计和错误，时间统一 UTC。
@@ -36,7 +39,8 @@
 ## 设置路径
 - `%APPDATA%\RustBackup\config.json`
 - `%LOCALAPPDATA%\RustBackup\state.db`
-- 托管历史仓库示例 `%USERPROFILE%\RustBackup\Backups\.rustbackup\work-documents\...`，云端另建隐含命名空间并以 file ID 管理。
+- 托管历史仓库位于本地目标父目录的 `.rustbackup\<task-id>`，例如 `%USERPROFILE%\RustBackup\Backups\.rustbackup\work-documents\...`；本地镜像与历史对象物理分离，源扫描剪枝 `.rustbackup`。云端另建隐含命名空间并以 file ID 管理。
+- 恢复 API 默认要求一个尚不存在的新目录，并将文件写入同路径层级；已有目录仅在显式传入覆盖确认后才替换对应文件，不删除目录中其他文件。
 
 ## C 盘优先与首次引导（强制实现）
 - 默认 `source.path` 为空字符串；仅当 `enabled=false` 时允许此状态。启用前必须弹出源文件夹选择器并验证存在、为目录、可读取。空值不得解析为 `.`、当前工作目录或 `C:\`。

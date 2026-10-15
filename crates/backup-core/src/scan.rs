@@ -44,6 +44,8 @@ pub enum ScanError {
     InvalidRelativePath(PathBuf),
     #[error("file timestamp is outside the supported range: {0}")]
     TimestampOutOfRange(PathBuf),
+    #[error("excluded scan directory is invalid: {0}")]
+    InvalidExcludedPath(PathBuf),
 }
 
 struct DirectoryFrame {
@@ -58,12 +60,30 @@ pub struct Scanner {
     frames: Vec<DirectoryFrame>,
     recursive: bool,
     filters: FilterSet,
+    excluded_paths: Vec<PathBuf>,
 }
 
 impl Scanner {
     pub fn new(task: &BackupTask) -> Result<Self, ScanError> {
+        Self::new_excluding(task, &[])
+    }
+
+    /// Creates a scanner that skips managed directories before reading their entries.
+    pub fn new_excluding(task: &BackupTask, excluded_paths: &[PathBuf]) -> Result<Self, ScanError> {
         let paths = validate_task_paths(task)?;
         let filters = FilterSet::new(&task.filters)?;
+        let mut canonical_excludes = Vec::with_capacity(excluded_paths.len());
+        for path in excluded_paths {
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|_| ScanError::InvalidExcludedPath(path.to_path_buf()))?;
+            if is_reparse_point(&metadata) || !metadata.is_dir() || !path.is_absolute() {
+                return Err(ScanError::InvalidExcludedPath(path.to_path_buf()));
+            }
+            canonical_excludes.push(
+                fs::canonicalize(path)
+                    .map_err(|_| ScanError::InvalidExcludedPath(path.to_path_buf()))?,
+            );
+        }
         let entries = fs::read_dir(&paths.source).map_err(|error| ScanError::Io {
             path: paths.source.clone(),
             error,
@@ -76,6 +96,7 @@ impl Scanner {
             }],
             recursive: task.source.recursive,
             filters,
+            excluded_paths: canonical_excludes,
         })
     }
 }
@@ -109,6 +130,13 @@ impl Iterator for Scanner {
             };
 
             let absolute_path = entry.path();
+            if self
+                .excluded_paths
+                .iter()
+                .any(|excluded| is_path_within(&absolute_path, excluded))
+            {
+                continue;
+            }
             let relative_path = directory_relative_path.join(entry.file_name());
             let metadata = match fs::symlink_metadata(&absolute_path) {
                 Ok(metadata) => metadata,
@@ -153,6 +181,22 @@ impl Iterator for Scanner {
             return Some(Err(ScanError::UnsupportedEntry(absolute_path)));
         }
     }
+}
+
+fn is_path_within(path: &Path, root: &Path) -> bool {
+    let path_components = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+        .collect::<Vec<_>>();
+    let root_components = root
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+        .collect::<Vec<_>>();
+    root_components.len() <= path_components.len()
+        && root_components
+            .iter()
+            .zip(path_components.iter())
+            .all(|(root_part, path_part)| root_part == path_part)
 }
 
 pub fn relative_path_key(relative_path: &Path) -> Result<String, ScanError> {
@@ -362,6 +406,26 @@ mod tests {
             files[0].blake3_hex,
             blake3::hash(b"keep").to_hex().to_string()
         );
+    }
+
+    #[test]
+    fn scanner_skips_managed_directories_before_reading_their_files() {
+        let directory = tempfile::tempdir().expect("create isolated test directory");
+        let source = directory.path().join("source");
+        let destination = directory.path().join("destination");
+        let managed = source.join(".rustbackup");
+        fs::create_dir_all(&managed).expect("create isolated managed directory");
+        fs::create_dir(&destination).expect("create temporary destination");
+        fs::write(source.join("keep.txt"), b"keep").expect("write source file");
+        fs::write(managed.join("object.blob"), b"managed object").expect("write managed file");
+
+        let files = Scanner::new_excluding(&task(&source, &destination), &[managed])
+            .expect("initialize scan with an excluded repository")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("scan should skip managed files");
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].relative_path_key, "keep.txt");
     }
 
     #[test]

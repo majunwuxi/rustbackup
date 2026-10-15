@@ -12,7 +12,10 @@ use backup_core::{
     validate_task_paths, BackupMode, BackupTask, FilterSet, PathValidationError, ScanError,
     Scanner, SourceUnavailablePolicy,
 };
-use backup_storage::{BackupRunStatus, CommitOutcome, FileObservation, StateStore, StorageError};
+use backup_storage::{
+    BackupRunStatus, CommitOutcome, FileObservation, HistoryRepository, IndexedFile,
+    IndexedFileState, StateStore, StorageError,
+};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -39,6 +42,8 @@ pub enum LocalBackupError {
     UnsafeDestinationPath(PathBuf),
     #[error("destination path is occupied by a non-file: {0}")]
     DestinationTargetInvalid(PathBuf),
+    #[error("destination contains an untracked file that cannot be overwritten safely: {0}")]
+    UntrackedDestinationTarget(PathBuf),
     #[error("backup mode {0} is not implemented by the local M1 service")]
     UnsupportedMode(String),
     #[error("task {0} is not enabled")]
@@ -63,6 +68,8 @@ pub struct BackupSummary {
     pub copied_files: u64,
     pub source_missing_files: u64,
     pub cloud_pending_files: u64,
+    pub history_versions_removed: u64,
+    pub history_objects_removed: u64,
     pub deletion_review_required: bool,
     pub issues: Vec<String>,
     pub omitted_issue_count: u64,
@@ -77,6 +84,8 @@ impl BackupSummary {
             copied_files: 0,
             source_missing_files: 0,
             cloud_pending_files: 0,
+            history_versions_removed: 0,
+            history_objects_removed: 0,
             deletion_review_required: false,
             issues: Vec::new(),
             omitted_issue_count: 0,
@@ -193,9 +202,22 @@ fn run_reconciliation(
             path: destination_root,
             source,
         })?;
+    let history_repository = if task.versioning.enabled {
+        let repository_parent = destination_root.parent().unwrap_or(&destination_root);
+        Some(HistoryRepository::open_or_create(
+            &repository_parent.join(".rustbackup").join(&task.id),
+        )?)
+    } else {
+        None
+    };
 
     let mut summary = BackupSummary::new(run_id.clone());
-    let scanner = Scanner::new(task)?;
+    let scanner = if let Some(repository) = &history_repository {
+        let managed_root = repository.root().parent().unwrap_or(repository.root());
+        Scanner::new_excluding(task, &[managed_root.to_path_buf()])?
+    } else {
+        Scanner::new(task)?
+    };
     let filters = FilterSet::new(&task.filters).map_err(ScanError::from)?;
     let mut scan_complete = true;
 
@@ -210,6 +232,7 @@ fn run_reconciliation(
         };
         summary.scanned_files += 1;
         let display_path = scanned.relative_path.to_string_lossy().into_owned();
+        let previous = store.indexed_file_state(&task.id, &scanned.relative_path_key)?;
         let indexed = match store.record_file_seen(
             &task.id,
             &run_id,
@@ -232,33 +255,64 @@ fn run_reconciliation(
         if task.mode == BackupMode::Dual {
             summary.cloud_pending_files += 1;
         }
-        if store.destination_revision(indexed.file_id, "local")? >= indexed.source_revision {
+        let destination_is_current =
+            store.destination_revision(indexed.file_id, "local")? >= indexed.source_revision;
+        let history_is_current = match &history_repository {
+            Some(_) => {
+                store.has_recoverable_history_version(indexed.file_id, indexed.source_revision)?
+            }
+            None => true,
+        };
+        if destination_is_current && history_is_current {
             continue;
         }
 
-        let job_id = store.enqueue_local_copy(indexed.file_id, indexed.source_revision)?;
-        if let Err(error) = store.start_job(&job_id) {
-            summary.add_issue(format!("{}: {error}", display_path));
-            continue;
-        }
+        let job_id = if destination_is_current {
+            None
+        } else {
+            let job_id = store.enqueue_local_copy(indexed.file_id, indexed.source_revision)?;
+            if let Err(error) = store.start_job(&job_id) {
+                summary.add_issue(format!("{}: {error}", display_path));
+                continue;
+            }
+            Some(job_id)
+        };
 
-        let result = copy_scanned_file(
-            store,
-            &destination_root,
-            &scanned,
-            indexed.file_id,
-            indexed.source_revision,
-            &job_id,
-        );
+        let result = if let Some(job_id) = job_id.as_deref() {
+            copy_scanned_file(
+                store,
+                history_repository.as_ref(),
+                &destination_root,
+                &scanned,
+                &indexed,
+                previous.as_ref(),
+                job_id,
+            )
+            .map(Some)
+        } else if let Some(repository) = &history_repository {
+            save_history_only(
+                repository,
+                store,
+                &scanned,
+                indexed.file_id,
+                indexed.source_revision,
+            )
+            .map(|()| None)
+        } else {
+            Ok(None)
+        };
         match result {
-            Ok(CommitOutcome::Committed) => summary.copied_files += 1,
-            Ok(CommitOutcome::Stale) => summary.add_issue(format!(
+            Ok(Some(CommitOutcome::Committed)) => summary.copied_files += 1,
+            Ok(Some(CommitOutcome::Stale)) => summary.add_issue(format!(
                 "{}: source revision was superseded before local commit",
                 display_path
             )),
+            Ok(None) => {}
             Err(error) => {
                 let message = error.to_string();
-                store.retry_job(&job_id, &message)?;
+                if let Some(job_id) = job_id.as_deref() {
+                    store.retry_job(job_id, &message)?;
+                }
                 summary.add_issue(format!("{}: {message}", display_path));
             }
         }
@@ -292,17 +346,45 @@ fn run_reconciliation(
         summary.add_issue("source scan was incomplete; missing-file states were left unchanged");
     }
 
+    if scan_complete {
+        if let Some(repository) = &history_repository {
+            let retention_ms =
+                i64::from(task.versioning.retention_days).saturating_mul(24 * 60 * 60 * 1_000);
+            let now_ms = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|duration| i64::try_from(duration.as_millis()).ok());
+            if let Some(now_ms) = now_ms {
+                let cutoff_ms = now_ms.saturating_sub(retention_ms);
+                match repository.collect_expired_before(store, cutoff_ms) {
+                    Ok(gc) => {
+                        summary.history_versions_removed = gc.versions_removed;
+                        summary.history_objects_removed = gc.objects_removed;
+                    }
+                    Err(error) => {
+                        summary.add_issue(format!("history retention cleanup failed: {error}"))
+                    }
+                }
+            } else {
+                summary.add_issue("history retention cleanup skipped because the system clock is outside the supported range");
+            }
+        }
+    }
+
     Ok(summary)
 }
 
 fn copy_scanned_file(
     store: &mut StateStore,
+    history_repository: Option<&HistoryRepository>,
     destination_root: &Path,
     scanned: &backup_core::ScannedFile,
-    file_id: i64,
-    revision: i64,
+    indexed: &IndexedFile,
+    previous: Option<&IndexedFileState>,
     job_id: &str,
 ) -> Result<CommitOutcome, LocalBackupError> {
+    let file_id = indexed.file_id;
+    let revision = indexed.source_revision;
     let target = target_path(destination_root, &scanned.relative_path)?;
     let parent = target
         .parent()
@@ -310,7 +392,61 @@ fn copy_scanned_file(
     ensure_safe_target_parent(destination_root, parent)?;
     validate_existing_target(&target)?;
 
+    let destination_revision = store.destination_revision(file_id, "local")?;
+    let target_exists = target.exists();
+    if target_exists && destination_revision == 0 {
+        return Err(LocalBackupError::UntrackedDestinationTarget(target));
+    }
     let staged = create_stable_snapshot(&scanned.source_path, parent, &scanned.blake3_hex)?;
+    if target_exists {
+        if let Some(repository) = history_repository {
+            let old_relative_path = previous
+                .map(|state| Path::new(&state.display_relative_path))
+                .unwrap_or(&scanned.relative_path);
+            let old_target = target_path(destination_root, old_relative_path)?;
+            let old_parent = old_target
+                .parent()
+                .ok_or_else(|| LocalBackupError::UnsafeDestinationPath(old_target.clone()))?;
+            ensure_safe_target_parent(destination_root, old_parent)?;
+            validate_existing_target(&old_target)?;
+            let (actual_hash, actual_size) = hash_existing_target(&old_target)?;
+            if actual_hash != scanned.blake3_hex {
+                let old_hash = store
+                    .destination_checksum(file_id, "local")?
+                    .ok_or_else(|| {
+                        LocalBackupError::UntrackedDestinationTarget(old_target.clone())
+                    })?;
+                let relative_path_key = previous
+                    .map(|state| state.relative_path_key.as_str())
+                    .unwrap_or(&scanned.relative_path_key);
+                let display_relative_path = previous
+                    .map(|state| state.display_relative_path.clone())
+                    .unwrap_or_else(|| scanned.relative_path.to_string_lossy().into_owned());
+                repository.save_version(
+                    store,
+                    file_id,
+                    destination_revision,
+                    relative_path_key,
+                    &display_relative_path,
+                    &old_hash,
+                    actual_size,
+                    &old_target,
+                )?;
+            }
+        }
+    }
+    if let Some(repository) = history_repository {
+        repository.save_version(
+            store,
+            file_id,
+            revision,
+            &scanned.relative_path_key,
+            &scanned.relative_path.to_string_lossy(),
+            &scanned.blake3_hex,
+            scanned.size_bytes,
+            staged.path(),
+        )?;
+    }
     let checksum = scanned.blake3_hex.clone();
     let target_file_id = target.to_string_lossy().into_owned();
     store
@@ -330,6 +466,57 @@ fn copy_scanned_file(
             },
         )
         .map_err(LocalBackupError::from)
+}
+
+fn save_history_only(
+    repository: &HistoryRepository,
+    store: &mut StateStore,
+    scanned: &backup_core::ScannedFile,
+    file_id: i64,
+    revision: i64,
+) -> Result<(), LocalBackupError> {
+    let staged =
+        create_stable_snapshot(&scanned.source_path, repository.root(), &scanned.blake3_hex)?;
+    repository.save_version(
+        store,
+        file_id,
+        revision,
+        &scanned.relative_path_key,
+        &scanned.relative_path.to_string_lossy(),
+        &scanned.blake3_hex,
+        scanned.size_bytes,
+        staged.path(),
+    )?;
+    Ok(())
+}
+
+fn hash_existing_target(path: &Path) -> Result<(String, u64), LocalBackupError> {
+    validate_existing_target(path)?;
+    let mut file = open_source_no_follow(path).map_err(|source| LocalBackupError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let before_metadata = file.metadata().map_err(|source| LocalBackupError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let before = FileStamp::from_metadata(&before_metadata)
+        .ok_or_else(|| LocalBackupError::UnstableSource(path.to_path_buf()))?;
+    let mut hasher = blake3::Hasher::new();
+    io::copy(&mut file, &mut hasher).map_err(|source| LocalBackupError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let after_metadata = file.metadata().map_err(|source| LocalBackupError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let after = FileStamp::from_metadata(&after_metadata)
+        .ok_or_else(|| LocalBackupError::UnstableSource(path.to_path_buf()))?;
+    if before != after {
+        return Err(LocalBackupError::UnstableSource(path.to_path_buf()));
+    }
+    Ok((hasher.finalize().to_hex().to_string(), after.size))
 }
 
 fn validate_existing_target(target: &Path) -> Result<(), LocalBackupError> {
@@ -982,7 +1169,7 @@ mod tests {
 
     #[test]
     fn copies_new_and_changed_files_but_does_not_revise_unchanged_content() {
-        let (_temp, source, destination) = directories();
+        let (temp, source, destination) = directories();
         fs::write(source.join("hello.txt"), b"first").unwrap();
         let task = task(&source, &destination);
         let mut store = StateStore::open_in_memory().unwrap();
@@ -1002,6 +1189,109 @@ mod tests {
         assert_eq!(
             fs::read(destination.join("hello.txt")).unwrap(),
             b"second revision"
+        );
+        let file_id = store
+            .indexed_file_state("local-test", "hello.txt")
+            .unwrap()
+            .unwrap()
+            .file_id;
+        let repository =
+            HistoryRepository::open_or_create(&temp.path().join(".rustbackup").join("local-test"))
+                .unwrap();
+        let versions = repository.list_file_versions(&store, file_id).unwrap();
+        assert_eq!(versions.len(), 2);
+        assert!(versions[0].is_latest);
+        let restored = temp.path().join("restored-old-version");
+        repository
+            .restore_version(&mut store, &versions[1].version_id, &restored, false)
+            .unwrap();
+        assert_eq!(fs::read(restored.join("hello.txt")).unwrap(), b"first");
+    }
+
+    #[test]
+    fn local_scan_excludes_the_managed_history_repository() {
+        let temp = tempfile::tempdir().unwrap();
+        let output_parent = temp.path().join("output");
+        let source = output_parent.join(".rustbackup");
+        let destination = output_parent.join("Work");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("source.txt"), b"user data").unwrap();
+        let task = task(&source, &destination);
+        let mut store = StateStore::open_in_memory().unwrap();
+
+        let first = backup_once(&mut store, &task).unwrap();
+        assert_eq!(first.scanned_files, 0);
+        let second = backup_once(&mut store, &task).unwrap();
+        assert_eq!(second.scanned_files, 0);
+        assert!(!destination.join("source.txt").exists());
+        assert!(!destination.join("local-test").exists());
+    }
+
+    #[test]
+    fn migration_archives_an_existing_m1_copy_before_replacing_it() {
+        let (temp, source, destination) = directories();
+        fs::write(source.join("item.txt"), b"new source version").unwrap();
+        fs::write(destination.join("item.txt"), b"previous committed version").unwrap();
+        let task = task(&source, &destination);
+        let mut store = StateStore::open_in_memory().unwrap();
+        store.register_task(&task.id, &task.name, true).unwrap();
+        let first_run = store.begin_backup_run(&task.id).unwrap();
+        let previous_hash = blake3::hash(b"previous committed version")
+            .to_hex()
+            .to_string();
+        let previous = store
+            .record_file_seen(
+                &task.id,
+                &first_run,
+                FileObservation {
+                    relative_path_key: "item.txt",
+                    display_relative_path: "item.txt",
+                    size_bytes: b"previous committed version".len() as u64,
+                    modified_at_unix_ms: 1,
+                    blake3_hex: &previous_hash,
+                },
+            )
+            .unwrap();
+        let old_job = store
+            .enqueue_local_copy(previous.file_id, previous.source_revision)
+            .unwrap();
+        store.start_job(&old_job).unwrap();
+        store
+            .commit_local_if_current(
+                &old_job,
+                previous.file_id,
+                previous.source_revision,
+                &previous_hash,
+                "item.txt",
+                || Ok(()),
+            )
+            .unwrap();
+
+        let summary = backup_once(&mut store, &task).unwrap();
+        assert_eq!(summary.copied_files, 1);
+        assert_eq!(
+            fs::read(destination.join("item.txt")).unwrap(),
+            b"new source version"
+        );
+        let repository =
+            HistoryRepository::open_or_create(&temp.path().join(".rustbackup").join("local-test"))
+                .unwrap();
+        let versions = repository
+            .list_file_versions(&store, previous.file_id)
+            .unwrap();
+        assert_eq!(versions.len(), 2);
+        let old = versions
+            .iter()
+            .find(|version| version.source_revision == 1)
+            .unwrap();
+        let restored = temp.path().join("restored-m1-version");
+        repository
+            .restore_version(&mut store, &old.version_id, &restored, false)
+            .unwrap();
+        assert_eq!(
+            fs::read(restored.join("item.txt")).unwrap(),
+            b"previous committed version"
         );
     }
 

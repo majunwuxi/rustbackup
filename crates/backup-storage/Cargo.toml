@@ -7,7 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 rusqlite.workspace = true
-thiserror.workspace = true
-
-[dev-dependencies]
+blake3.workspace = true
+libc.workspace = true
 tempfile.workspace = true
+thiserror.workspace = true
