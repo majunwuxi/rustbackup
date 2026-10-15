@@ -201,6 +201,7 @@ mod tests {
         let oauth = Arc::new(
             OAuthClient::new(
                 "desktop-client",
+                "test-client-secret",
                 OAuthEndpoints::default(),
                 credential_store.clone(),
             )

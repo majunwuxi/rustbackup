@@ -42,7 +42,7 @@
 - [ ] 系统托盘、关闭窗口继续后台、Windows 安装包。
 **完成条件：** UI 退出和重启后后台队列持续，安装卸载及凭据处理安全。
 
-**M4 授权切片进度：** 桌面端已有 Tauri 2 授权页，可通过系统浏览器启动 OAuth PKCE loopback 流程；首次配置初始化到 `%APPDATA%\RustBackup\config.json`，只将 Google 账号 subject 写入默认任务绑定，刷新令牌由 `backup-drive` 写入 Windows Credential Manager。连接流程不会启用任务、创建 Drive 文件夹或上传文件；账号切换和后续 Drive 实测入口尚未实现。默认源路径仍为空，任务仍关闭。
+**M4 授权切片进度：** 桌面端已有 Tauri 2 授权页，可通过系统浏览器启动 OAuth PKCE loopback 流程；首次配置初始化到 `%APPDATA%\RustBackup\config.json`，只将 Google 账号 subject 写入默认任务绑定。OAuth Desktop 客户端密钥由用户在界面输入并保存到 Windows Credential Manager，与刷新令牌和上传会话 URI 一样不会进入 JSON、SQLite 或日志。连接流程不会启用任务、创建 Drive 文件夹或上传文件；账号切换和后续 Drive 实测入口尚未实现。默认源路径仍为空，任务仍关闭。
 
 ## M5 稳定化与发布
 - [ ] 集成测试：网络中断、文件并发写入、外接磁盘消失、海量文件、长路径、权限拒绝。

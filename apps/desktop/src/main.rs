@@ -17,6 +17,7 @@ const GOOGLE_OAUTH_CLIENT_ID: &str =
 struct GoogleDriveConnectionStatus {
     connected: bool,
     email: Option<String>,
+    client_secret_configured: bool,
 }
 
 #[tauri::command]
@@ -26,7 +27,67 @@ fn google_drive_connection_status() -> Result<GoogleDriveConnectionStatus, Strin
     Ok(GoogleDriveConnectionStatus {
         connected: task.destinations.google_drive.account_id.is_some(),
         email: None,
+        client_secret_configured: google_oauth_client_secret_configured()?,
     })
+}
+
+fn google_oauth_client_secret_configured() -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        use backup_drive::{CredentialStore, PlatformCredentialStore};
+
+        let credentials =
+            PlatformCredentialStore::new().map_err(|_| "Windows 凭据管理器不可用".to_owned())?;
+        credentials
+            .get(&google_oauth_client_secret_key())
+            .map(|secret| secret.is_some())
+            .map_err(|_| "无法读取 Windows 凭据管理器".to_owned())
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(false)
+    }
+}
+
+#[cfg(windows)]
+fn google_oauth_client_secret_key() -> String {
+    format!("oauth-client-secret:{GOOGLE_OAUTH_CLIENT_ID}")
+}
+
+fn validate_google_oauth_client_secret(secret: &str) -> Result<(), String> {
+    if secret.is_empty()
+        || secret.trim() != secret
+        || secret.len() > 1024
+        || secret.chars().any(char::is_control)
+    {
+        return Err(
+            "客户端密钥无效；请粘贴 Google Cloud 中的 OAuth Desktop 客户端密钥。".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn store_google_oauth_client_secret(secret: String) -> Result<(), String> {
+    validate_google_oauth_client_secret(&secret)?;
+
+    #[cfg(windows)]
+    {
+        use backup_drive::{CredentialStore, PlatformCredentialStore};
+
+        let credentials =
+            PlatformCredentialStore::new().map_err(|_| "Windows 凭据管理器不可用".to_owned())?;
+        credentials
+            .put(&google_oauth_client_secret_key(), &secret)
+            .map_err(|_| "无法保存到 Windows 凭据管理器".to_owned())
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = secret;
+        Err("Google Drive 授权仅支持 Windows".to_owned())
+    }
 }
 
 #[tauri::command]
@@ -66,12 +127,22 @@ async fn connect_google_drive_windows(
         return Err("此任务已绑定 Google 账号；当前版本不会自动切换绑定账号。".to_owned());
     }
 
-    let credentials: Arc<dyn CredentialStore> =
-        Arc::new(PlatformCredentialStore::new().map_err(|error| error.to_string())?);
+    let platform_credentials =
+        PlatformCredentialStore::new().map_err(|_| "Windows 凭据管理器不可用".to_owned())?;
+    let client_secret = platform_credentials
+        .get(&google_oauth_client_secret_key())
+        .map_err(|_| "无法读取 Windows 凭据管理器".to_owned())?
+        .ok_or_else(|| "请先将 OAuth Desktop 客户端密钥保存到 Windows 凭据管理器。".to_owned())?;
+    let credentials: Arc<dyn CredentialStore> = Arc::new(platform_credentials);
     let oauth_endpoints = OAuthEndpoints::default();
     let oauth = Arc::new(
-        OAuthClient::new(GOOGLE_OAUTH_CLIENT_ID, oauth_endpoints.clone(), credentials)
-            .map_err(|error| error.to_string())?,
+        OAuthClient::new(
+            GOOGLE_OAUTH_CLIENT_ID,
+            client_secret,
+            oauth_endpoints.clone(),
+            credentials,
+        )
+        .map_err(|error| error.to_string())?,
     );
     let (authorization_url, session) =
         begin_authorization(GOOGLE_OAUTH_CLIENT_ID, &oauth_endpoints)
@@ -97,6 +168,7 @@ async fn connect_google_drive_windows(
     Ok(GoogleDriveConnectionStatus {
         connected: true,
         email: identity.email,
+        client_secret_configured: true,
     })
 }
 
@@ -164,6 +236,7 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             google_drive_connection_status,
+            store_google_oauth_client_secret,
             connect_google_drive
         ])
         .run(tauri::generate_context!())
@@ -225,5 +298,14 @@ mod tests {
             app_data.join("RustBackup").join("config.json")
         );
         assert!(user_config_path_in(Path::new("")).is_err());
+    }
+
+    #[test]
+    fn client_secret_validation_rejects_empty_whitespace_control_and_long_values() {
+        assert!(validate_google_oauth_client_secret("GOCSPX-example-secret").is_ok());
+        assert!(validate_google_oauth_client_secret("").is_err());
+        assert!(validate_google_oauth_client_secret(" leading-space").is_err());
+        assert!(validate_google_oauth_client_secret("secret\nvalue").is_err());
+        assert!(validate_google_oauth_client_secret(&"x".repeat(1025)).is_err());
     }
 }

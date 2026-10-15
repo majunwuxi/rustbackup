@@ -278,6 +278,7 @@ struct CachedToken {
 
 pub struct OAuthClient {
     client_id: String,
+    client_secret: String,
     endpoints: OAuthEndpoints,
     credentials: Arc<dyn CredentialStore>,
     agent: ureq::Agent,
@@ -301,11 +302,19 @@ struct UserInfoResponse {
 impl OAuthClient {
     pub fn new(
         client_id: impl Into<String>,
+        client_secret: impl Into<String>,
         endpoints: OAuthEndpoints,
         credentials: Arc<dyn CredentialStore>,
     ) -> Result<Self, OAuthError> {
         let client_id = client_id.into();
-        if client_id.trim().is_empty() || client_id.chars().any(char::is_control) {
+        let client_secret = client_secret.into();
+        if client_id.trim().is_empty()
+            || client_id.chars().any(char::is_control)
+            || client_secret.trim().is_empty()
+            || client_secret.trim() != client_secret
+            || client_secret.len() > 1024
+            || client_secret.chars().any(char::is_control)
+        {
             return Err(OAuthError::InvalidConfiguration);
         }
         validate_google_endpoint(
@@ -321,6 +330,7 @@ impl OAuthClient {
         )?;
         Ok(Self {
             client_id,
+            client_secret,
             endpoints,
             credentials,
             agent: ureq::AgentBuilder::new()
@@ -496,7 +506,10 @@ impl OAuthClient {
         operation: &'static str,
         fields: &[(&str, &str)],
     ) -> Result<T, OAuthError> {
-        let response = match self.agent.post(endpoint).send_form(fields) {
+        let mut form_fields = Vec::with_capacity(fields.len() + 1);
+        form_fields.extend_from_slice(fields);
+        form_fields.push(("client_secret", self.client_secret.as_str()));
+        let response = match self.agent.post(endpoint).send_form(&form_fields) {
             Ok(response) => response,
             Err(ureq::Error::Status(status, response)) => {
                 let (code, description) = provider_error(response);
@@ -543,6 +556,7 @@ pub(crate) fn mock_oauth_client(
 ) -> Arc<OAuthClient> {
     Arc::new(OAuthClient {
         client_id: "mock-desktop-client".to_owned(),
+        client_secret: "mock-client-secret".to_owned(),
         endpoints: OAuthEndpoints::default(),
         credentials,
         agent: ureq::AgentBuilder::new().build(),
@@ -745,6 +759,26 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn oauth_client_rejects_invalid_client_secrets() {
+        for secret in ["", " leading", "trailing ", "line\nbreak"] {
+            assert!(OAuthClient::new(
+                "desktop-client",
+                secret,
+                OAuthEndpoints::default(),
+                Arc::new(MemoryCredentials::default()),
+            )
+            .is_err());
+        }
+        assert!(OAuthClient::new(
+            "desktop-client",
+            "x".repeat(1025),
+            OAuthEndpoints::default(),
+            Arc::new(MemoryCredentials::default()),
+        )
+        .is_err());
+    }
+
     #[derive(Default)]
     struct MemoryCredentials(Mutex<HashMap<String, String>>);
 
@@ -823,6 +857,7 @@ mod tests {
         });
         let client = OAuthClient {
             client_id: "desktop-client".to_owned(),
+            client_secret: "test-client-secret".to_owned(),
             endpoints: OAuthEndpoints {
                 authorization: format!("{endpoint}/auth"),
                 token: format!("{endpoint}/token"),
@@ -860,6 +895,7 @@ mod tests {
                     0 => {
                         assert!(request.starts_with("POST /token "));
                         assert!(request.contains("code_verifier="));
+                        assert!(request.contains("client_secret=test-client-secret"));
                         write_http_response(
                             &mut stream,
                             200,
@@ -882,6 +918,7 @@ mod tests {
                     _ => {
                         assert!(request.starts_with("POST /token "));
                         assert!(request.contains("grant_type=refresh_token"));
+                        assert!(request.contains("client_secret=test-client-secret"));
                         assert!(request.contains("refresh_token=refresh-secret"));
                         write_http_response(
                             &mut stream,
@@ -896,6 +933,7 @@ mod tests {
         let credentials = Arc::new(MemoryCredentials::default());
         let client = OAuthClient {
             client_id: "desktop-client".to_owned(),
+            client_secret: "test-client-secret".to_owned(),
             endpoints: OAuthEndpoints {
                 authorization: format!("{endpoint}/auth"),
                 token: format!("{endpoint}/token"),

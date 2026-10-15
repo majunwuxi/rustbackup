@@ -31,6 +31,15 @@
           正在读取账户状态…
         </div>
 
+        <div id="secret-setup" class="secret-setup" hidden>
+          <label for="client-secret">OAuth Desktop 客户端密钥</label>
+          <p>从 Google Cloud Console 的 OAuth 客户端详情中复制客户端密钥。密钥只保存到本机 Windows 凭据管理器，不会写入配置文件或发送到聊天。</p>
+          <div class="secret-controls">
+            <input id="client-secret" type="password" autocomplete="off" spellcheck="false" maxlength="1024" />
+            <button id="save-secret" class="secondary" type="button">安全保存</button>
+          </div>
+        </div>
+
         <button id="connect" class="primary" type="button" disabled>
           连接 Google Drive
         </button>
@@ -42,7 +51,7 @@
         <span>不会启用任务、扫描文件、创建云端文件夹或上传文件。之后仍需选择并确认测试源目录和专用云端目录。</span>
       </aside>
 
-      <footer>授权令牌仅保存到 Windows 凭据管理器。</footer>
+      <footer>客户端密钥与授权令牌仅保存到 Windows 凭据管理器。</footer>
     </main>
   </body>
 </html>

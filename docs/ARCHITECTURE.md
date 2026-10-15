@@ -26,7 +26,7 @@
 
 ## Google Drive 注意事项
 - Desktop OAuth 2.0 Authorization Code + PKCE，IPv4 loopback redirect；授权 URL 交由 UI 在系统浏览器打开。`drive.file` 与 OIDC `openid email` scope 仅用于应用文件和账号身份；不向任意主机发送访问令牌。
-- refresh token 与 resumable session URI 保存在 Windows Credential Manager；两者均按凭据处理，禁止进入 JSON、SQLite 和日志。访问令牌只驻留内存；无有效授权时返回 `waiting_auth`。
+- OAuth Desktop 客户端密钥、refresh token 与 resumable session URI 保存在 Windows Credential Manager；均按凭据处理，禁止进入 JSON、SQLite 和日志。访问令牌只驻留内存；无有效授权时返回 `waiting_auth`。
 - 优先受限 `drive.file` scope。首版由应用自己创建专用目录，不保证可浏览任意现有 Drive 目录。
 - Drive 允许同名文件，必须持久化 ID；目录路径到 ID 映射防重复；首次执行前校验绑定账号与文件夹。
 - 支持指数退避、Retry-After、配额/403/429/5xx 分类；离线入队；使用有效期内 resumable session，过期重建。
