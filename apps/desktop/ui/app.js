@@ -15,8 +15,10 @@ function showConnected(email) {
   connection.textContent = email
     ? `已连接 Google 账户：${email}`
     : "已连接 Google 账户";
-  connectButton.disabled = true;
-  connectButton.textContent = "账户已连接";
+  connectButton.disabled = !clientSecretConfigured;
+  connectButton.textContent = clientSecretConfigured
+    ? "重新授权 Google Drive"
+    : "请先安全保存客户端密钥";
 }
 
 async function refreshStatus() {
@@ -68,23 +70,36 @@ saveSecretButton.addEventListener("click", async () => {
 });
 
 connectButton.addEventListener("click", async () => {
+  const reauthorizing = accountConnected;
+  if (reauthorizing) {
+    accountConnected = false;
+    connection.classList.remove("connected");
+    connection.textContent = "正在清除此设备的登录状态…";
+  }
   connectButton.disabled = true;
-  connectButton.textContent = "等待 Google 授权…";
-  message.textContent = "系统浏览器将打开 Google 授权页面。完成授权后请返回此窗口。";
+  connectButton.textContent = reauthorizing ? "正在重新授权…" : "等待 Google 授权…";
+  message.textContent = reauthorizing
+    ? "将清除此设备保存的登录令牌和账号绑定，然后打开 Google 授权页面。完成授权后请返回此窗口。"
+    : "系统浏览器将打开 Google 授权页面。完成授权后请返回此窗口。";
   message.classList.remove("success");
 
   try {
-    const status = await invoke("connect_google_drive");
+    const status = await invoke(
+      reauthorizing ? "reauthorize_google_drive" : "connect_google_drive",
+    );
     showConnected(status.email);
     message.textContent = "账户连接成功。备份任务仍保持关闭。";
     message.classList.add("success");
   } catch (error) {
+    await refreshStatus();
     message.textContent = `连接未完成：${String(error)}`;
     message.classList.remove("success");
-    connectButton.disabled = !clientSecretConfigured;
-    connectButton.textContent = clientSecretConfigured
-      ? "重试连接 Google Drive"
-      : "请先安全保存客户端密钥";
+    if (!accountConnected) {
+      connectButton.disabled = !clientSecretConfigured;
+      connectButton.textContent = clientSecretConfigured
+        ? "重试连接 Google Drive"
+        : "请先安全保存客户端密钥";
+    }
   }
 });
 

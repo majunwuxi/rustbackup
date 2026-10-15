@@ -134,6 +134,23 @@ async fn connect_google_drive(
     }
 }
 
+#[tauri::command]
+async fn reauthorize_google_drive(
+    app: tauri::AppHandle,
+) -> Result<GoogleDriveConnectionStatus, String> {
+    #[cfg(windows)]
+    {
+        clear_google_drive_local_auth()?;
+        connect_google_drive_windows(app).await
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        Err("Google Drive authorization is supported only on Windows".to_owned())
+    }
+}
+
 #[cfg(windows)]
 async fn connect_google_drive_windows(
     app: tauri::AppHandle,
@@ -157,16 +174,7 @@ async fn connect_google_drive_windows(
 
     let platform_credentials =
         PlatformCredentialStore::new().map_err(|_| "Windows 凭据管理器不可用".to_owned())?;
-    let client_secret = match GOOGLE_OAUTH_CLIENT_SECRET {
-        Some(secret) if validate_google_oauth_client_secret(secret).is_ok() => secret.to_owned(),
-        Some(_) => return Err("此应用的 OAuth 构建配置无效。".to_owned()),
-        None => platform_credentials
-            .get(&google_oauth_client_secret_key())
-            .map_err(|_| "无法读取 Windows 凭据管理器".to_owned())?
-            .ok_or_else(|| {
-                "开发构建请先将 OAuth Desktop 客户端密钥保存到 Windows 凭据管理器。".to_owned()
-            })?,
-    };
+    let client_secret = load_google_oauth_client_secret(&platform_credentials)?;
     let credentials: Arc<dyn CredentialStore> = Arc::new(platform_credentials);
     let oauth_endpoints = OAuthEndpoints::default();
     let oauth = Arc::new(
@@ -205,6 +213,58 @@ async fn connect_google_drive_windows(
         client_secret_configured: true,
         test_environment: google_oauth_test_environment(),
     })
+}
+
+#[cfg(windows)]
+fn load_google_oauth_client_secret(
+    credentials: &dyn backup_drive::CredentialStore,
+) -> Result<String, String> {
+    match GOOGLE_OAUTH_CLIENT_SECRET {
+        Some(secret) if validate_google_oauth_client_secret(secret).is_ok() => {
+            Ok(secret.to_owned())
+        }
+        Some(_) => Err("此应用的 OAuth 构建配置无效。".to_owned()),
+        None => credentials
+            .get(&google_oauth_client_secret_key())
+            .map_err(|_| "无法读取 Windows 凭据管理器".to_owned())?
+            .ok_or_else(|| {
+                "开发构建请先将 OAuth Desktop 客户端密钥保存到 Windows 凭据管理器。".to_owned()
+            }),
+    }
+}
+
+#[cfg(windows)]
+fn clear_google_drive_local_auth() -> Result<(), String> {
+    use std::sync::Arc;
+
+    use backup_drive::{CredentialStore, OAuthClient, OAuthEndpoints, PlatformCredentialStore};
+
+    let (config_path, mut config) = load_or_initialize_config()?;
+    let account_id = default_task(&config)?
+        .destinations
+        .google_drive
+        .account_id
+        .clone();
+
+    if let Some(account_id) = account_id {
+        let platform_credentials =
+            PlatformCredentialStore::new().map_err(|_| "Windows 凭据管理器不可用".to_owned())?;
+        let client_secret = load_google_oauth_client_secret(&platform_credentials)?;
+        let credentials: Arc<dyn CredentialStore> = Arc::new(platform_credentials);
+        let oauth = OAuthClient::new(
+            GOOGLE_OAUTH_CLIENT_ID,
+            client_secret,
+            OAuthEndpoints::default(),
+            credentials,
+        )
+        .map_err(|error| error.to_string())?;
+        oauth
+            .revoke_local_credentials(&account_id)
+            .map_err(|error| error.to_string())?;
+    }
+
+    clear_default_task_google_account(&mut config)?;
+    save_config_atomic(&config_path, &config).map_err(config_error_text)
 }
 
 fn load_or_initialize_config() -> Result<(PathBuf, AppConfig), String> {
@@ -262,17 +322,40 @@ fn set_default_task_google_account(config: &mut AppConfig, account_id: &str) -> 
     }
 }
 
+fn clear_default_task_google_account(config: &mut AppConfig) -> Result<(), String> {
+    let task = config
+        .tasks
+        .iter_mut()
+        .find(|task| task.id == DEFAULT_TASK_ID)
+        .ok_or_else(|| "RustBackup default task is missing from the configuration".to_owned())?;
+    task.destinations.google_drive.account_id = None;
+    Ok(())
+}
+
 fn config_error_text(error: ConfigError) -> String {
     error.to_string()
 }
 
 fn main() {
+    #[cfg(windows)]
+    if std::env::args().any(|argument| argument == "--clear-google-auth") {
+        match clear_google_drive_local_auth() {
+            Ok(()) => println!("已清除此设备保存的 Google 登录令牌和账号绑定。"),
+            Err(error) => {
+                eprintln!("清理 Google 登录状态失败：{error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             google_drive_connection_status,
             store_google_oauth_client_secret,
-            connect_google_drive
+            connect_google_drive,
+            reauthorize_google_drive
         ])
         .run(tauri::generate_context!())
         .expect("failed to start RustBackup desktop");
@@ -316,6 +399,20 @@ mod tests {
                 .as_deref(),
             Some("google-subject-one")
         );
+    }
+
+    #[test]
+    fn clearing_google_account_binding_keeps_backup_task_disabled_and_source_empty() {
+        let mut config = parse_config_json(DEFAULT_CONFIG).expect("default config is valid");
+        set_default_task_google_account(&mut config, "google-subject-123")
+            .expect("account should be bound");
+
+        clear_default_task_google_account(&mut config).expect("account binding should clear");
+
+        let task = default_task(&config).expect("default task exists");
+        assert!(task.destinations.google_drive.account_id.is_none());
+        assert!(!task.enabled);
+        assert!(task.source.path.as_os_str().is_empty());
     }
 
     #[test]
