@@ -1,7 +1,3 @@
-PRAGMA foreign_keys = ON;
-PRAGMA journal_mode = WAL;
-PRAGMA busy_timeout = 5000;
-
 CREATE TABLE IF NOT EXISTS backup_tasks (
   task_id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -20,6 +16,7 @@ CREATE TABLE IF NOT EXISTS files (
   blake3_hex TEXT,
   source_revision INTEGER NOT NULL DEFAULT 0,
   source_missing INTEGER NOT NULL DEFAULT 0,
+  last_seen_run TEXT,
   UNIQUE(task_id, relative_path_key)
 );
 

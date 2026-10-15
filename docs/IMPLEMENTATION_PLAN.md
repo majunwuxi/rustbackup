@@ -8,12 +8,14 @@
 **完成条件：** 配置解析/验证在 Windows CI 通过，无真实数据触碰。
 
 ## M1 本地备份可靠内核
-- [ ] SQLite 初始化/迁移；文件索引、源修订、任务队列与目标提交状态。
-- [ ] 目录流式扫描、globset、大小写路径 key、symlink/junction 防护。
-- [ ] notify 防抖 2s、启动 reconcile、60min reconcile，监听失败时标记扫描。
-- [ ] 受控快照 + 原子目标替换 + BLAKE3，失败保持旧有效备份。
-- [ ] 处理创建、修改、移动、删除（默认不传播）及源盘失联。
+- [x] SQLite 初始化/迁移；文件索引、源修订、任务队列与目标提交状态。
+- [x] 目录流式扫描、globset、大小写路径 key、symlink/junction 防护。
+- [x] notify 防抖 2s、启动 reconcile、60min reconcile，监听失败时标记扫描。
+- [x] 受控快照 + 原子目标替换 + BLAKE3，失败保持旧有效备份。
+- [x] 处理创建、修改、移动、删除（默认不传播）及源盘失联。
 **完成条件：** 本地增量可运行，断电模拟/进程终止恢复、异常保护测试通过。
+
+**M1 交付记录：** `backup-storage` 嵌入并版本化执行 SQLite schema，按内容 hash 递增源修订，独立记录目标提交与失败；进程重启时将 running 任务恢复为 retry/reconcile 状态。`backup-core` 提供流式扫描与大小写归一化 key。`backup-local` 提供 `backup_once` 和可关闭的实时/周期调度器；源文件快照与 hash 校验通过后才以同卷临时文件原子替换。源缺失不删除目标，排除规则变化不记作删除；一次发现至少 10 个且占跟踪文件一半以上的缺失会要求复核。双目标任务当前只执行本地分支并返回 `partial_success`，Google Drive 留待 M3。测试使用隔离临时目录，备份目标根目录必须已存在，不由内核自动创建。
 
 ## M2 7 天历史与恢复
 - [ ] 历史对象仓库、manifest 和引用关系；写入完整后才记为 recoverable。

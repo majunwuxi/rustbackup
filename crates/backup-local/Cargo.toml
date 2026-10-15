@@ -7,3 +7,9 @@ rust-version.workspace = true
 
 [dependencies]
 backup-core = { path = "../backup-core" }
+backup-storage = { path = "../backup-storage" }
+blake3.workspace = true
+libc.workspace = true
+notify.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
