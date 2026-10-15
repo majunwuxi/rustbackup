@@ -272,6 +272,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "backup-ipc"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "backup-local"
 version = "0.1.0"
 dependencies = [
@@ -3151,6 +3160,7 @@ version = "0.1.0"
 dependencies = [
  "backup-core",
  "backup-drive",
+ "backup-ipc",
  "backup-local",
  "backup-storage",
 ]
@@ -3161,6 +3171,7 @@ version = "0.1.0"
 dependencies = [
  "backup-core",
  "backup-drive",
+ "backup-ipc",
  "backup-local",
  "backup-storage",
  "serde",

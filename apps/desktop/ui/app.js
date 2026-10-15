@@ -3,6 +3,7 @@ const connection = document.querySelector("#connection");
 const connectButton = document.querySelector("#connect");
 const message = document.querySelector("#message");
 const environment = document.querySelector("#environment");
+const agentStatus = document.querySelector("#agent-status");
 const secretSetup = document.querySelector("#secret-setup");
 const clientSecretInput = document.querySelector("#client-secret");
 const saveSecretButton = document.querySelector("#save-secret");
@@ -41,6 +42,21 @@ async function refreshStatus() {
     connection.textContent = "无法读取 RustBackup 授权状态";
     message.textContent = String(error);
     message.classList.remove("success");
+  }
+}
+
+async function refreshAgentStatus() {
+  try {
+    const status = await invoke("agent_status");
+    agentStatus.textContent = status.active_tasks > 0
+      ? `后台 Agent 运行中 · ${status.active_tasks} 项任务`
+      : "后台 Agent 运行中 · 空闲";
+    agentStatus.classList.add("running");
+    agentStatus.title = `运行 ${status.uptime_seconds} 秒`;
+  } catch {
+    agentStatus.textContent = "后台 Agent 未连接";
+    agentStatus.classList.remove("running");
+    agentStatus.title = "请启动 rustbackup-agent 后重试";
   }
 }
 
@@ -104,3 +120,5 @@ connectButton.addEventListener("click", async () => {
 });
 
 refreshStatus();
+refreshAgentStatus();
+window.setInterval(refreshAgentStatus, 5000);

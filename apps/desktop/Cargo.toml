@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 backup-core = { path = "../../crates/backup-core" }
 backup-drive = { path = "../../crates/backup-drive" }
+backup-ipc = { path = "../../crates/backup-ipc" }
 serde.workspace = true
 tauri.workspace = true
 tauri-plugin-opener.workspace = true

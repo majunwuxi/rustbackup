@@ -36,6 +36,13 @@ body {
   margin-bottom: 28px;
 }
 
+.header-badges {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .eyebrow {
   margin: 0 0 8px;
   color: #64748b;
@@ -64,6 +71,22 @@ h1 {
   background: #edf4ff;
   font-size: 12px;
   font-weight: 600;
+}
+
+.agent-status {
+  padding: 7px 11px;
+  border: 1px solid #f1d7a5;
+  border-radius: 999px;
+  color: #855b13;
+  background: #fff7e8;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.agent-status.running {
+  border-color: #b8dfc7;
+  color: #17633f;
+  background: #eaf7ef;
 }
 
 .card {

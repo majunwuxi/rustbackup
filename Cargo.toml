@@ -5,6 +5,7 @@ members = [
     "crates/backup-storage",
     "crates/backup-local",
     "crates/backup-drive",
+    "crates/backup-ipc",
     "apps/agent",
     "apps/desktop",
 ]

@@ -10,3 +10,4 @@ backup-core = { path = "../../crates/backup-core" }
 backup-local = { path = "../../crates/backup-local" }
 backup-storage = { path = "../../crates/backup-storage" }
 backup-drive = { path = "../../crates/backup-drive" }
+backup-ipc = { path = "../../crates/backup-ipc" }

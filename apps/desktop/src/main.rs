@@ -30,6 +30,14 @@ struct GoogleDriveConnectionStatus {
 }
 
 #[tauri::command]
+async fn agent_status() -> Result<backup_ipc::AgentStatus, String> {
+    tauri::async_runtime::spawn_blocking(backup_ipc::query_agent_status)
+        .await
+        .map_err(|_| "Agent 状态查询任务意外结束".to_owned())?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn google_drive_connection_status() -> Result<GoogleDriveConnectionStatus, String> {
     let (_, config) = load_or_initialize_config()?;
     let task = default_task(&config)?;
@@ -352,6 +360,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
+            agent_status,
             google_drive_connection_status,
             store_google_oauth_client_secret,
             connect_google_drive,
