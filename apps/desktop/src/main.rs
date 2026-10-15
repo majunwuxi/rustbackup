@@ -976,11 +976,11 @@ fn main() {
     }
 
     let started_at_login = std::env::args().any(|argument| argument == "--login-startup");
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
-        .setup(move |app| {
+        .setup(|app| {
             install_system_tray(app)?;
             let (_, config) = load_or_initialize_config().map_err(std::io::Error::other)?;
             if let Err(error) =
@@ -990,11 +990,6 @@ fn main() {
             }
             if let Err(error) = start_agent_process(app.handle()) {
                 eprintln!("RustBackup Agent startup failed: {error}");
-            }
-            if started_at_login && config.application.start_minimized {
-                if let Some(window) = app.get_webview_window("main") {
-                    window.hide()?;
-                }
             }
             Ok(())
         })
@@ -1026,8 +1021,26 @@ fn main() {
             connect_google_drive,
             reauthorize_google_drive
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to start RustBackup desktop");
+        .build(tauri::generate_context!())
+        .expect("failed to build RustBackup desktop");
+    app.run(move |app_handle, event| {
+        if let tauri::RunEvent::Ready = event {
+            let should_start_hidden = started_at_login
+                && load_or_initialize_config()
+                    .map(|(_, config)| config.application.start_minimized)
+                    .unwrap_or(false);
+            if let Some(window) = app_handle.get_webview_window("main") {
+                let result = if should_start_hidden {
+                    window.hide()
+                } else {
+                    window.show()
+                };
+                if let Err(error) = result {
+                    eprintln!("RustBackup initial window visibility setup failed: {error}");
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
