@@ -1,5 +1,6 @@
 /target/
 /apps/desktop/gen/
+/apps/desktop/binaries/rustbackup-agent-*.exe
 *.db
 *.db-shm
 *.db-wal

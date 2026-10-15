@@ -37,15 +37,16 @@
 **M3 交付记录：** `backup-drive` 实现桌面 OAuth authorization code + PKCE loopback、账号身份查询、刷新令牌与上传会话 URI 的 Windows Credential Manager 存储，以及受 `drive.file` scope 限制的 Drive v3 客户端。目录和文件以私有 `appProperties` 标记并按 ID 复用；上传通过 resumable session 分块，配额/网络退避、重启续传、失效重建及不确定完成对账均覆盖本机模拟服务测试。`backup-local::backup_once_with_drive` 先完成本地分支，再独立提交 Drive 目标状态；更新前把旧云端文件复制到任务历史目录，cloud manifest 存在 SQLite v3 的独立表中。SQLite v4 增加云端 GC 租约；本地和云端历史都固定保留 7 天，云端清理前核对账号、历史父目录和全部 manifest 标记，恢复中的副本不会被删除。云端恢复先下载并校验 BLAKE3，再将完整目录原子发布到新的目标目录并记录审计。未授权时返回 `waiting_auth`，保留本地成果。2026-10-15 使用授权测试账号运行 `apps/desktop/examples/live_drive_smoke.rs`：在 `%TEMP%` 临时源/镜像/恢复目录与唯一应用托管 Drive 任务目录中，验证上传、相同内容重复运行、更新归档和历史恢复；结果见 `docs/TEST_AND_ACCEPTANCE.md`。真实网络中断、其他 Drive 文件访问边界和超过 7 天的云端历史清理仍待验收，M3 尚未完成全部人工验收。
 
 ## M4 Agent + Windows GUI
-- [ ] 独立 Agent 登录后自启动；Agent 作为普通用户进程运行。
-- [x] Agent 当前用户单实例；Named Pipes 仅授予当前用户与 SYSTEM，拒绝远程客户端。协议版本化、帧长受限，目前只提供状态查询。
-- [ ] Tauri 2 UI：任务列表、添加/编辑、授权、查看进度、暂停/恢复、历史/恢复、日志。
-- [ ] 系统托盘、关闭窗口继续后台、Windows 安装包。
-**完成条件：** UI 退出和重启后后台队列持续，安装卸载及凭据处理安全。
+- [x] 独立 Agent 登录后自启动；HKCU Run 以普通用户启动桌面端隐藏窗口并启动独立 Agent。
+- [x] Agent 当前用户单实例；Named Pipes 仅授予当前用户与 SYSTEM，拒绝远程客户端；状态查询显示活动 worker 数。
+- [x] Agent 读取用户配置运行启用任务；SQLite v5 保存手动运行队列，Agent/worker 中断后重新排队。
+- [x] Tauri 2 UI：任务列表、添加/编辑、授权、运行/状态、暂停/恢复、历史/恢复、日志和 Agent 设置。
+- [x] 系统托盘；关闭窗口隐藏到托盘，退出 UI 不退出 Agent；当前用户 NSIS 安装包和卸载启动项清理钩子。
+**完成条件：** 代码实现、工作区检查及 Windows NSIS 构建已通过。安装/卸载后的 Windows 用户会话行为仍需按 `docs/TEST_AND_ACCEPTANCE.md` 人工验收；M3 的云端权限边界与七天后清理验收仍未完成。
 
 **M4 授权切片进度：** 桌面端已有 Tauri 2 授权页，可通过系统浏览器启动 OAuth PKCE loopback 流程；首次配置初始化到 `%APPDATA%\RustBackup\config.json`，只将 Google 账号 subject 写入默认任务绑定。发行构建可通过 `RUSTBACKUP_GOOGLE_OAUTH_CLIENT_ID` 和 `RUSTBACKUP_GOOGLE_OAUTH_CLIENT_SECRET` 预置 OAuth Desktop 客户端，使普通用户只需点击连接并在 Google 页面授权；`RUSTBACKUP_GOOGLE_OAUTH_ENVIRONMENT=production` 控制正式环境标识，默认仍为测试环境。未预置客户端密钥的开发构建保留 Credential Manager 安全录入入口。客户端密钥按 Google 的公开桌面客户端模型处理，不作为用户密码或防滥用边界；refresh token 与上传会话 URI 仍由 Windows Credential Manager 保护。当前 OAuth 项目仍是测试环境，正式面向公众前需配置生产 OAuth 项目并完成适用的同意屏幕验证。连接流程不会启用任务、创建 Drive 文件夹或上传文件；账号切换和后续 Drive 实测入口尚未实现。默认源路径仍为空，任务仍关闭。
 
-**M4 Agent IPC 切片进度：** 新增 `backup-ipc` 版本化 JSON 帧协议，帧上限 64 KiB，目前只允许查询 Agent 状态；服务端等待完整请求帧最多 5 秒。Agent 使用当前用户 SID 命名的 Windows mutex 保持单实例，并通过拒绝远程客户端的 Named Pipe 提供状态。管道和 mutex 的受保护 DACL 仅授予当前用户及 SYSTEM。桌面端每 5 秒查询一次并显示在线/空闲状态；`rustbackup-agent --status` 可检查本机 IPC。Agent 当前不自动登录启动，也尚未执行备份队列；托盘、任务管理界面及安装包仍未完成，因此 M4 未完成验收。
+**M4 交付记录（2026-10-15）：** Agent 使用用户 `%APPDATA%` 配置和 `%LOCALAPPDATA%` SQLite/日志；仅运行已启用且路径有效的任务，默认源仍为空、任务关闭。桌面端启停任务前要求确认，且只在确认后创建本地目标；手动运行请求及结果持久化在 SQLite v5 中。Agent IPC 继续限制为当前用户状态查询，报告活动 worker 数。Tauri UI 加入任务、历史、账户、日志、设置页面及目录选择；托盘关闭行为保留 Agent。登录启动写入当前用户 Run 项，NSIS 安装模式为 currentUser，卸载钩子只清除该启动项并保留用户凭据/数据。`cargo tauri build --bundles nsis` 已生成 `target/release/bundle/nsis/RustBackup_0.1.0_x64-setup.exe`；Release 桌面端/Agent 已在 `%TEMP%` 隔离配置中启动验证 UI 进程退出与重开时复用 Agent。尚未实际安装 NSIS 包；托盘交互和卸载后检查见测试清单。
 
 ## M5 稳定化与发布
 - [ ] 集成测试：网络中断、文件并发写入、外接磁盘消失、海量文件、长路径、权限拒绝。

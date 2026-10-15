@@ -9,14 +9,15 @@ rust-version.workspace = true
 backup-core = { path = "../../crates/backup-core" }
 backup-drive = { path = "../../crates/backup-drive" }
 backup-ipc = { path = "../../crates/backup-ipc" }
-serde.workspace = true
-tauri.workspace = true
-tauri-plugin-opener.workspace = true
-
-[build-dependencies]
-tauri-build.workspace = true
-
-[dev-dependencies]
 backup-local = { path = "../../crates/backup-local" }
 backup-storage = { path = "../../crates/backup-storage" }
+serde.workspace = true
 serde_json.workspace = true
+tauri.workspace = true
+tauri-plugin-dialog.workspace = true
+tauri-plugin-opener.workspace = true
+tauri-plugin-shell.workspace = true
+
+[build-dependencies]
+serde_json.workspace = true
+tauri-build.workspace = true

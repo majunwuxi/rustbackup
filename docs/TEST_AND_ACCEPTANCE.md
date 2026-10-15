@@ -22,10 +22,14 @@ Windows 上进行真实 Drive API 冒烟验收：`cargo run -p rustbackup-deskto
 - [x] 2026-10-15 真实 Drive 冒烟验收：专用应用目录中上传虚构文件、重复运行无重复上传、更新时保存旧版本、恢复旧版本并校验内容；临时源/镜像/恢复目录位于 `%TEMP%`。具体目录名和范围见下方记录。
 - [ ] 人工验收：验证 Google 授权访问边界；本轮只验证应用创建的测试文件位于其专用任务 folder ID 下，没有读取或修改其他 Drive 文件。
 - [ ] 人工验收：在专用测试账号中验证超过 7 天的托管历史副本会被清理，当前文件和 7 天内副本仍保留；不得使用真实备份目录做此验证。
-- [ ] Agent 登录启动和用户态生命周期；关闭 UI 后后台继续工作；重启后重建队列状态。
+- [x] M4 隔离桌面/Agent 冒烟：Release 桌面端以 `--login-startup` 在独立 `%TEMP%` profile 启动；默认任务关闭且源路径为空。终止 UI 后 Agent 仍为原 PID/在线，重新启动 UI 后复用同一 Agent；测试结束已停止两个进程。
+- [ ] 人工验收：安装 NSIS 包后验证 Windows 登录触发、点关闭后窗口隐藏至托盘、托盘退出 UI 后 Agent 继续、重启后队列恢复；卸载后启动项移除且用户数据/凭据仍保留。
 - [x] Agent IPC 协议单元验收：版本校验、仅状态查询命令、帧长度上限及畸形帧拒绝。
 - [x] 2026-10-15 Windows Agent IPC 冒烟：同一用户成功连续查询 3 次状态；启动第二实例后其以退出码 0 结束，原实例仍可响应。Agent 只创建 Named Pipe 和 mutex，未读取配置或访问备份路径。
+- [x] 2026-10-15 M4 隔离 Agent 运行冒烟：Release Agent 使用 `%TEMP%\RustBackup-M4-Agent-269c232e99c345fdb9e9f3743ce8f382` 下临时 APPDATA/LOCALAPPDATA 启动；默认任务保持关闭且源路径为空。状态为 `Idle`、活动任务数为 0；第二实例退出码 0，原实例仍在线；随后已停止测试进程。临时 profile 仅含测试配置、SQLite 状态与日志。
 - [ ] Windows 多进程人工验收：同用户仅一个 Agent；桌面端可读取状态；其他用户和远程客户端不能连接。
+- [x] 2026-10-15 M4 Windows 发布构建：`cargo tauri build --bundles nsis` 成功生成 x64 current-user 安装包；构建前钩子会构建并暂存独立 Agent sidecar。
+- [x] M4 前端静态检查：`node --check apps/desktop/ui/app.js`。
 - [ ] 路径嵌套、junction、symlink 和目录循环被安全阻止。
 - [ ] `bidirectional` 报 UnsupportedMode，不能误作 dual。
 

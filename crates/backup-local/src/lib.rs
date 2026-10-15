@@ -1296,6 +1296,13 @@ pub struct SchedulerReport {
     pub last_backup_error: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManualRunCompletion {
+    pub run_id: String,
+    pub status: String,
+    pub error_summary: Option<String>,
+}
+
 /// Runs startup, debounced watcher and periodic reconciliations until the
 /// caller closes the shutdown channel. Watcher errors force a full scan and
 /// remain visible in the returned report.
@@ -1303,6 +1310,21 @@ pub fn run_scheduled(
     store: &mut StateStore,
     task: &BackupTask,
     shutdown: &Receiver<()>,
+) -> Result<SchedulerReport, LocalBackupError> {
+    run_scheduled_with_drive(store, task, shutdown, None, None, None, None)
+}
+
+/// Runs the scheduler with an optional Drive client and durable manual-run
+/// requests from the Agent. A request is acknowledged only after its backup
+/// attempt has completed, so the caller can safely retry it after a restart.
+pub fn run_scheduled_with_drive(
+    store: &mut StateStore,
+    task: &BackupTask,
+    shutdown: &Receiver<()>,
+    drive: Option<&DriveClient>,
+    manual_runs: Option<&Receiver<String>>,
+    completed_manual_runs: Option<&mpsc::Sender<ManualRunCompletion>>,
+    mut report_changed: Option<&mut dyn FnMut(&SchedulerReport)>,
 ) -> Result<SchedulerReport, LocalBackupError> {
     validate_mode(task)?;
     if !task.enabled {
@@ -1325,11 +1347,21 @@ pub fn run_scheduled(
     }
 
     if task.schedule.scan_on_startup {
-        record_scheduled_backup(store, task, &mut report);
+        record_scheduled_backup(store, task, drive, &mut report);
         report.reconciliations += 1;
+        if let Some(report_changed) = report_changed.as_deref_mut() {
+            report_changed(&report);
+        }
     }
     let interval = Duration::from_secs(u64::from(task.schedule.reconcile_interval_minutes) * 60);
-    let mut next_reconcile = Instant::now() + reconcile_delay(&report, interval);
+    let mut next_reconcile = if matches!(
+        task.schedule.schedule_type,
+        backup_core::ScheduleType::Manual
+    ) {
+        None
+    } else {
+        Some(Instant::now() + reconcile_delay(&report, interval))
+    };
     let mut next_source_check = Instant::now() + SOURCE_REAPPEAR_CHECK_INTERVAL;
 
     loop {
@@ -1338,22 +1370,55 @@ pub fn run_scheduled(
             Err(mpsc::TryRecvError::Empty) => {}
         }
 
+        let manual_run_id = manual_runs.and_then(|requests| requests.try_recv().ok());
+
         let now = Instant::now();
         if now >= next_source_check {
             let was_available = source.is_some();
             source = validated_source_or_pause(task, &mut report)?;
             if source.is_none() {
                 watcher = None;
-                next_reconcile = now + SOURCE_REAPPEAR_CHECK_INTERVAL;
-            } else if !was_available {
+                next_reconcile = if matches!(
+                    task.schedule.schedule_type,
+                    backup_core::ScheduleType::Manual
+                ) {
+                    None
+                } else {
+                    Some(now + SOURCE_REAPPEAR_CHECK_INTERVAL)
+                };
+            } else if !was_available
+                && !matches!(
+                    task.schedule.schedule_type,
+                    backup_core::ScheduleType::Manual
+                )
+            {
                 debouncer.request_full_reconcile();
             }
             next_source_check = now + SOURCE_REAPPEAR_CHECK_INTERVAL;
         }
-        if debouncer.take_ready(now) || now >= next_reconcile {
-            record_scheduled_backup(store, task, &mut report);
+        let periodic_reconcile_due = next_reconcile.is_some_and(|deadline| now >= deadline);
+        if manual_run_id.is_some() || debouncer.take_ready(now) || periodic_reconcile_due {
+            record_scheduled_backup(store, task, drive, &mut report);
             report.reconciliations += 1;
-            next_reconcile = Instant::now() + reconcile_delay(&report, interval);
+            if !matches!(
+                task.schedule.schedule_type,
+                backup_core::ScheduleType::Manual
+            ) {
+                next_reconcile = Some(Instant::now() + reconcile_delay(&report, interval));
+            }
+            if let (Some(run_id), Some(completed)) = (manual_run_id, completed_manual_runs) {
+                let _ = completed.send(ManualRunCompletion {
+                    run_id,
+                    status: report
+                        .last_backup_status
+                        .clone()
+                        .unwrap_or_else(|| "error".to_owned()),
+                    error_summary: report.last_backup_error.clone(),
+                });
+            }
+            if let Some(report_changed) = report_changed.as_deref_mut() {
+                report_changed(&report);
+            }
             source = validated_source_or_pause(task, &mut report)?;
             if source.is_none() {
                 watcher = None;
@@ -1368,10 +1433,13 @@ pub fn run_scheduled(
             continue;
         }
 
-        let next_deadline = debouncer
-            .next_deadline()
-            .unwrap_or(next_reconcile)
-            .min(next_reconcile);
+        let fallback_deadline = now + Duration::from_millis(250);
+        let next_deadline = match (debouncer.next_deadline(), next_reconcile) {
+            (Some(debounce), Some(reconcile)) => debounce.min(reconcile),
+            (Some(debounce), None) => debounce,
+            (None, Some(reconcile)) => reconcile,
+            (None, None) => fallback_deadline,
+        };
         let timeout = next_deadline
             .saturating_duration_since(now)
             .min(Duration::from_millis(250));
@@ -1418,9 +1486,10 @@ pub fn run_scheduled(
 fn record_scheduled_backup(
     store: &mut StateStore,
     task: &BackupTask,
+    drive: Option<&DriveClient>,
     report: &mut SchedulerReport,
 ) {
-    match backup_once(store, task) {
+    match backup_once_with_drive(store, task, drive) {
         Ok(summary) => {
             report.last_backup_status = Some(summary.status);
             if !summary.issues.is_empty() {

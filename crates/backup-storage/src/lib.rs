@@ -14,7 +14,8 @@ const INITIAL_MIGRATION: &str = include_str!("../../../sql/001_init.sql");
 const HISTORY_MIGRATION: &str = include_str!("../../../sql/002_history.sql");
 const DRIVE_MIGRATION: &str = include_str!("../../../sql/003_drive.sql");
 const DRIVE_RETENTION_MIGRATION: &str = include_str!("../../../sql/004_drive_retention.sql");
-const SCHEMA_VERSION: i64 = 4;
+const TASK_QUEUE_MIGRATION: &str = include_str!("../../../sql/005_task_queue.sql");
+const SCHEMA_VERSION: i64 = 5;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 type IndexedFileRow = (i64, i64, String, Option<i64>, Option<String>);
 
@@ -42,6 +43,8 @@ pub enum StorageError {
     RevisionOverflow,
     #[error("task id is invalid: {0}")]
     InvalidTaskId(String),
+    #[error("query limit is outside the supported range")]
+    InvalidQueryLimit,
     #[error("content hash is invalid")]
     InvalidHash,
     #[error("history repository path is unsafe or unavailable: {0}")]
@@ -179,6 +182,30 @@ impl BackupRunStatus {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackupRunRecord {
+    pub run_id: String,
+    pub task_id: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub status: String,
+    pub scanned_files: u64,
+    pub changed_files: u64,
+    pub error_summary: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskRunRecord {
+    pub run_id: String,
+    pub task_id: String,
+    pub requested_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub status: String,
+    pub result_status: Option<String>,
+    pub error_summary: Option<String>,
+}
+
 pub struct StateStore {
     connection: Connection,
 }
@@ -217,6 +244,16 @@ pub struct HistoryRepository {
 
 impl StateStore {
     pub fn open(path: &Path) -> Result<Self, StorageError> {
+        Self::open_internal(path, true)
+    }
+
+    /// Opens a database for a concurrent desktop or worker connection without
+    /// treating another process's active rows as interrupted work.
+    pub fn open_shared(path: &Path) -> Result<Self, StorageError> {
+        Self::open_internal(path, false)
+    }
+
+    fn open_internal(path: &Path, recover_interrupted_work: bool) -> Result<Self, StorageError> {
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -224,14 +261,17 @@ impl StateStore {
             fs::create_dir_all(parent)?;
         }
         let connection = Connection::open(path)?;
-        Self::from_connection(connection)
+        Self::from_connection(connection, recover_interrupted_work)
     }
 
     pub fn open_in_memory() -> Result<Self, StorageError> {
-        Self::from_connection(Connection::open_in_memory()?)
+        Self::from_connection(Connection::open_in_memory()?, true)
     }
 
-    fn from_connection(connection: Connection) -> Result<Self, StorageError> {
+    fn from_connection(
+        connection: Connection,
+        recover_interrupted_work: bool,
+    ) -> Result<Self, StorageError> {
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
@@ -270,12 +310,21 @@ impl StateStore {
         if version == 3 {
             let transaction = connection.unchecked_transaction()?;
             transaction.execute_batch(DRIVE_RETENTION_MIGRATION)?;
+            transaction.pragma_update(None, "user_version", 4_i64)?;
+            transaction.commit()?;
+            version = 4;
+        }
+        if version == 4 {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute_batch(TASK_QUEUE_MIGRATION)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
 
         let store = Self { connection };
-        store.recover_interrupted_work()?;
+        if recover_interrupted_work {
+            store.recover_interrupted_work()?;
+        }
         Ok(store)
     }
 
@@ -365,6 +414,163 @@ impl StateStore {
             return Err(StorageError::MissingRun(run_id.to_owned()));
         }
         Ok(())
+    }
+
+    /// Returns recent run summaries for the task. The bound prevents a UI
+    /// request from making the local IPC/UI response unbounded.
+    pub fn recent_backup_runs(
+        &self,
+        task_id: &str,
+        limit: u32,
+    ) -> Result<Vec<BackupRunRecord>, StorageError> {
+        validate_task_id(task_id)?;
+        if limit == 0 || limit > 100 {
+            return Err(StorageError::InvalidQueryLimit);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT run_id,task_id,started_at,finished_at,status,scanned_files,changed_files,error_summary \
+             FROM backup_runs WHERE task_id=?1 ORDER BY started_at DESC,run_id DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![task_id, i64::from(limit)], |row| {
+            let scanned: i64 = row.get(5)?;
+            let changed: i64 = row.get(6)?;
+            Ok(BackupRunRecord {
+                run_id: row.get(0)?,
+                task_id: row.get(1)?,
+                started_at: row.get(2)?,
+                finished_at: row.get(3)?,
+                status: row.get(4)?,
+                scanned_files: u64::try_from(scanned)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(5, scanned))?,
+                changed_files: u64::try_from(changed)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, changed))?,
+                error_summary: row.get(7)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    pub fn enqueue_task_run(
+        &self,
+        task_id: &str,
+        task_name: &str,
+    ) -> Result<TaskRunRecord, StorageError> {
+        validate_task_id(task_id)?;
+        if task_name.trim().is_empty() || task_name.len() > 256 {
+            return Err(StorageError::InvalidDisplayPath(task_name.to_owned()));
+        }
+        self.register_task(task_id, task_name, true)?;
+        let run_id = next_id("taskrun");
+        self.connection.execute(
+            "INSERT INTO task_run_queue(run_id,task_id,requested_at,status) \
+             VALUES(?1,?2,datetime('now'),'queued')",
+            params![run_id, task_id],
+        )?;
+        self.task_run(&run_id)?
+            .ok_or_else(|| StorageError::InvalidJobState(run_id))
+    }
+
+    pub fn queued_task_runs(&self, task_id: &str) -> Result<Vec<TaskRunRecord>, StorageError> {
+        validate_task_id(task_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT run_id,task_id,requested_at,started_at,finished_at,status,result_status,error_summary \
+             FROM task_run_queue WHERE task_id=?1 AND status='queued' ORDER BY requested_at,run_id",
+        )?;
+        let rows = statement.query_map(params![task_id], task_run_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    pub fn claim_task_run(&self, run_id: &str) -> Result<bool, StorageError> {
+        let changed = self.connection.execute(
+            "UPDATE task_run_queue SET status='running',started_at=datetime('now'),error_summary=NULL \
+             WHERE run_id=?1 AND status='queued'",
+            params![run_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn requeue_task_run(&self, run_id: &str) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE task_run_queue SET status='queued',started_at=NULL \
+             WHERE run_id=?1 AND status='running'",
+            params![run_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_task_run(
+        &self,
+        run_id: &str,
+        result_status: &str,
+        error_summary: Option<&str>,
+    ) -> Result<(), StorageError> {
+        if !matches!(
+            result_status,
+            "succeeded" | "partial_success" | "waiting_auth" | "paused" | "retry_wait" | "error"
+        ) {
+            return Err(StorageError::InvalidJobState(run_id.to_owned()));
+        }
+        let changed = self.connection.execute(
+            "UPDATE task_run_queue SET status='completed',finished_at=datetime('now'), \
+             result_status=?2,error_summary=?3 WHERE run_id=?1 AND status='running'",
+            params![run_id, result_status, error_summary],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::InvalidJobState(run_id.to_owned()));
+        }
+        Ok(())
+    }
+
+    pub fn recover_interrupted_task_runs(&self) -> Result<u64, StorageError> {
+        let changed = self.connection.execute(
+            "UPDATE task_run_queue SET status='queued',started_at=NULL, \
+             error_summary='requeued after Agent restart' WHERE status='running'",
+            [],
+        )?;
+        u64::try_from(changed).map_err(|_| StorageError::CountOverflow)
+    }
+
+    pub fn requeue_running_task_runs(&self, task_id: &str) -> Result<u64, StorageError> {
+        validate_task_id(task_id)?;
+        let changed = self.connection.execute(
+            "UPDATE task_run_queue SET status='queued',started_at=NULL, \
+             error_summary='requeued after task configuration changed' \
+             WHERE task_id=?1 AND status='running'",
+            params![task_id],
+        )?;
+        u64::try_from(changed).map_err(|_| StorageError::CountOverflow)
+    }
+
+    pub fn recent_task_runs(
+        &self,
+        task_id: &str,
+        limit: u32,
+    ) -> Result<Vec<TaskRunRecord>, StorageError> {
+        validate_task_id(task_id)?;
+        if limit == 0 || limit > 100 {
+            return Err(StorageError::InvalidQueryLimit);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT run_id,task_id,requested_at,started_at,finished_at,status,result_status,error_summary \
+             FROM task_run_queue WHERE task_id=?1 ORDER BY requested_at DESC,run_id DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![task_id, i64::from(limit)], task_run_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    fn task_run(&self, run_id: &str) -> Result<Option<TaskRunRecord>, StorageError> {
+        self.connection
+            .query_row(
+                "SELECT run_id,task_id,requested_at,started_at,finished_at,status,result_status,error_summary \
+                 FROM task_run_queue WHERE run_id=?1",
+                params![run_id],
+                task_run_from_row,
+            )
+            .optional()
+            .map_err(StorageError::from)
     }
 
     pub fn record_file_seen(
@@ -859,6 +1065,30 @@ impl StateStore {
             .map_err(StorageError::from)
     }
 
+    pub fn list_recent_drive_history_versions(
+        &self,
+        task_id: &str,
+        limit: u32,
+    ) -> Result<Vec<DriveHistoryVersion>, StorageError> {
+        validate_task_id(task_id)?;
+        if limit == 0 || limit > 500 {
+            return Err(StorageError::InvalidQueryLimit);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT h.manifest_id,h.task_id,h.file_id,h.source_revision,h.drive_file_id,h.account_id, \
+             h.relative_path_key,h.display_relative_path,h.content_hash,h.size_bytes,h.created_at_ms \
+             FROM drive_history_manifests h WHERE h.task_id=?1 AND h.status='recoverable' \
+             AND NOT EXISTS(SELECT 1 FROM drive_history_gc_claims c WHERE c.manifest_id=h.manifest_id) \
+             ORDER BY h.created_at_ms DESC,h.manifest_id DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            params![task_id, i64::from(limit)],
+            drive_history_version_from_row,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
     /// Claims expired cloud history for deletion. A claim and restore start use
     /// immediate transactions so only one operation can own a manifest at a time.
     pub fn claim_expired_drive_history_versions(
@@ -1174,6 +1404,24 @@ impl HistoryRepository {
         Ok(Self { root })
     }
 
+    /// Opens an already-managed history repository without creating files.
+    /// This is used by history browsing so viewing versions has no side effects.
+    pub fn open_existing(root: &Path) -> Result<Self, StorageError> {
+        let root_metadata = fs::symlink_metadata(root)?;
+        if !root_metadata.is_dir() || is_reparse_point(&root_metadata) {
+            return Err(StorageError::HistoryIntegrity(root.to_path_buf()));
+        }
+        let canonical_root = fs::canonicalize(root)?;
+        let objects = canonical_root.join("objects");
+        let objects_metadata = fs::symlink_metadata(&objects)?;
+        if !objects_metadata.is_dir() || is_reparse_point(&objects_metadata) {
+            return Err(StorageError::HistoryIntegrity(objects));
+        }
+        Ok(Self {
+            root: canonical_root,
+        })
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -1315,6 +1563,44 @@ impl HistoryRepository {
              AND m.status='recoverable' ORDER BY v.source_revision DESC,v.created_at DESC",
         )?;
         let rows = statement.query_map(params![file_id], |row| {
+            let size: i64 = row.get(6)?;
+            let size_bytes = u64::try_from(size)
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, size))?;
+            Ok(HistoryVersion {
+                version_id: row.get(0)?,
+                file_id: row.get(1)?,
+                source_revision: row.get(2)?,
+                relative_path_key: row.get(3)?,
+                display_relative_path: row.get(4)?,
+                content_hash: row.get(5)?,
+                size_bytes,
+                created_at_unix_ms: row.get(7)?,
+                is_latest: row.get(8)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    pub fn list_recent_task_versions(
+        &self,
+        store: &StateStore,
+        task_id: &str,
+        limit: u32,
+    ) -> Result<Vec<HistoryVersion>, StorageError> {
+        validate_task_id(task_id)?;
+        if limit == 0 || limit > 500 {
+            return Err(StorageError::InvalidQueryLimit);
+        }
+        let mut statement = store.connection.prepare(
+            "SELECT v.version_id,v.file_id,v.source_revision,m.relative_path_key, \
+             m.display_relative_path,v.content_hash,v.size_bytes,m.created_at_ms,v.is_latest \
+             FROM files f JOIN file_versions v ON v.file_id=f.file_id \
+             JOIN history_manifests m ON m.manifest_id=v.version_id \
+             WHERE f.task_id=?1 AND v.storage_target='local' AND v.status='recoverable' \
+             AND m.status='recoverable' ORDER BY m.created_at_ms DESC,v.version_id DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![task_id, i64::from(limit)], |row| {
             let size: i64 = row.get(6)?;
             let size_bytes = u64::try_from(size)
                 .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, size))?;
@@ -1988,6 +2274,19 @@ fn validate_task_id(task_id: &str) -> Result<(), StorageError> {
     }
 }
 
+fn task_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRunRecord> {
+    Ok(TaskRunRecord {
+        run_id: row.get(0)?,
+        task_id: row.get(1)?,
+        requested_at: row.get(2)?,
+        started_at: row.get(3)?,
+        finished_at: row.get(4)?,
+        status: row.get(5)?,
+        result_status: row.get(6)?,
+        error_summary: row.get(7)?,
+    })
+}
+
 fn validate_drive_identifier(value: &str) -> Result<(), StorageError> {
     if !value.is_empty()
         && value.len() <= 256
@@ -2111,13 +2410,13 @@ mod tests {
                 "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN \
              ('files','transfer_jobs','destination_states','history_objects','history_manifests', \
               'history_object_refs','restore_audit','drive_task_bindings','drive_history_manifests', \
-              'drive_restore_audit','drive_history_gc_claims')",
+              'drive_restore_audit','drive_history_gc_claims','task_run_queue')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(table_count, 11);
+        assert_eq!(table_count, 12);
     }
 
     #[test]
@@ -2127,7 +2426,7 @@ mod tests {
         connection
             .pragma_update(None, "user_version", 1_i64)
             .unwrap();
-        let store = StateStore::from_connection(connection).unwrap();
+        let store = StateStore::from_connection(connection, true).unwrap();
         let version: i64 = store
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -2157,7 +2456,7 @@ mod tests {
             .pragma_update(None, "user_version", 3_i64)
             .unwrap();
 
-        let store = StateStore::from_connection(connection).unwrap();
+        let store = StateStore::from_connection(connection, true).unwrap();
         let version: i64 = store
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -3009,5 +3308,49 @@ mod tests {
             modified_at_unix_ms,
             blake3_hex,
         }
+    }
+
+    #[test]
+    fn persistent_task_queue_claims_completes_and_recovers_runs() {
+        let store = new_store();
+        let first = store
+            .enqueue_task_run("work-documents", "Work documents")
+            .expect("manual run should enter the persistent queue");
+        assert_eq!(first.status, "queued");
+        assert!(store.claim_task_run(&first.run_id).unwrap());
+        assert!(!store.claim_task_run(&first.run_id).unwrap());
+
+        store
+            .finish_task_run(
+                &first.run_id,
+                "partial_success",
+                Some("Drive authorization required"),
+            )
+            .unwrap();
+        let completed = store.recent_task_runs("work-documents", 10).unwrap();
+        assert_eq!(completed[0].status, "completed");
+        assert_eq!(
+            completed[0].result_status.as_deref(),
+            Some("partial_success")
+        );
+
+        let retry = store
+            .enqueue_task_run("work-documents", "Work documents")
+            .unwrap();
+        assert!(store.claim_task_run(&retry.run_id).unwrap());
+        store
+            .finish_task_run(&retry.run_id, "retry_wait", Some("Source is unavailable"))
+            .unwrap();
+        let completed = store.recent_task_runs("work-documents", 10).unwrap();
+        assert_eq!(completed[0].result_status.as_deref(), Some("retry_wait"));
+
+        let interrupted = store
+            .enqueue_task_run("work-documents", "Work documents")
+            .unwrap();
+        assert!(store.claim_task_run(&interrupted.run_id).unwrap());
+        assert_eq!(store.recover_interrupted_task_runs().unwrap(), 1);
+        let queued = store.queued_task_runs("work-documents").unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].run_id, interrupted.run_id);
     }
 }

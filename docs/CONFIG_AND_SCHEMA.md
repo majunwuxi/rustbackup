@@ -21,7 +21,7 @@
 - `*.tmp` 和 `~$*` 匹配每层文件名；`.git` 和 `node_modules` 为目录组件精确匹配并剪枝，case insensitive；规则改变只重新扫描，不自动清理旧备份。
 
 ## SQLite 迁移
-`sql/001_init.sql` 初始化 schema v1，`sql/002_history.sql` 升级到 v2，`sql/003_drive.sql` 升级到 v3，`sql/004_drive_retention.sql` 升级到 v4；代码按 `PRAGMA user_version` 顺序执行嵌入式迁移。关键不变量：
+`sql/001_init.sql` 初始化 schema v1，`sql/002_history.sql` 升级到 v2，`sql/003_drive.sql` 升级到 v3，`sql/004_drive_retention.sql` 升级到 v4，`sql/005_task_queue.sql` 升级到 v5；代码按 `PRAGMA user_version` 顺序执行嵌入式迁移。关键不变量：
 - `files` 唯一 `(task_id,relative_path_key)`；key 需规范化 Windows 不区分大小写，保留 display path。
 - `file_versions` 可恢复状态和存储引用；保留最新有效版本。
 - `history_objects` 以 BLAKE3 内容哈希寻址，manifest 记录每个文件版本的安全相对路径；只有对象写入、flush 和哈希/大小校验完成后，manifest 与版本才会转为 `recoverable`。
@@ -33,13 +33,14 @@
 - `transfer_jobs` 每个 `(task_id, relative_path_key, source_revision, destination)` 应幂等；旧 revision 不覆盖新 revision。
 - `destination_states` 各目标拥有自己提交的 revision 与远端 ID；禁止使用整任务一个 bool 表示已备份。
 - `backup_runs` 记录扫描/备份统计和错误，时间统一 UTC。
+- `task_run_queue` 持久化 UI 发起的单次运行请求；Agent 先原子认领，再把每次运行结果与对应请求 ID 一起完成。Agent 或任务 worker 中断后，未完成的 `running` 请求重新进入 `queued`，不会被误报成功。
 - 状态变更依托事务；启动时 running 恢复为需对账/重试，不得直接 succeeded。
 
 Drive API 使用固定 Google HTTPS 主机及 `drive.file` scope。客户端只创建/更新应用管理的任务文件夹；云端历史不会传播源删除，也不会对 Google Drive 任意目录做全盘扫描。
 
 ## 状态机
 任务：`idle,scanning,backing_up,partial_success,waiting_auth,paused,error`。
-队列：`pending -> running -> succeeded`；`running -> retry_wait -> running`；终止 `failed`；崩溃恢复优先 reconcile。
+传输队列：`pending -> running -> succeeded`；`running -> retry_wait -> running`；终止 `failed`；崩溃恢复优先 reconcile。手动运行队列：`queued -> running -> completed`，最终结果保存在 `result_status`；Agent/worker 中断时 `running -> queued`。
 
 ## 设置路径
 - `%APPDATA%\RustBackup\config.json`

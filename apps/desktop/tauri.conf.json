@@ -4,7 +4,8 @@
   "version": "0.1.0",
   "identifier": "com.rustbackup.desktop",
   "build": {
-    "frontendDist": "ui"
+    "frontendDist": "ui",
+    "beforeBuildCommand": "powershell -NoProfile -ExecutionPolicy Bypass -File ../scripts/stage-agent.ps1"
   },
   "app": {
     "withGlobalTauri": true,
@@ -27,7 +28,15 @@
     ]
   },
   "bundle": {
-    "active": false,
-    "icon": ["icons/icon.ico"]
+    "active": true,
+    "targets": ["nsis"],
+    "externalBin": ["binaries/rustbackup-agent"],
+    "icon": ["icons/icon.ico"],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "installerHooks": "./windows/nsis-hooks.nsh"
+      }
+    }
   }
 }

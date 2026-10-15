@@ -9,6 +9,7 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 #[serde(rename_all = "snake_case")]
 pub enum AgentState {
     Idle,
+    Running,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -140,7 +141,8 @@ mod windows_transport {
     use std::mem::size_of;
     use std::os::windows::io::{FromRawHandle, RawHandle};
     use std::ptr::{null, null_mut};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -401,6 +403,13 @@ mod windows_transport {
     }
 
     pub fn serve_status_forever(started: std::time::Instant) -> Result<(), IpcError> {
+        serve_status_forever_with_active_tasks(started, Arc::new(AtomicU32::new(0)))
+    }
+
+    pub fn serve_status_forever_with_active_tasks(
+        started: std::time::Instant,
+        active_tasks: Arc<AtomicU32>,
+    ) -> Result<(), IpcError> {
         let sid = current_user_sid()?;
         let (pipe_name, _) = names(&sid);
         let security = SecurityDescriptor::for_user_sid(&sid)?;
@@ -435,8 +444,17 @@ mod windows_transport {
             let mut stream = unsafe { File::from_raw_handle(pipe.into_raw() as RawHandle) };
             if wait_for_complete_frame(pipe_handle).is_ok() {
                 if let Ok(request) = read_frame::<_, Request>(&mut stream) {
-                    let response =
-                        dispatch(request, AgentStatus::idle(started.elapsed().as_secs()));
+                    let active = active_tasks.load(Ordering::Relaxed);
+                    let status = AgentStatus {
+                        state: if active == 0 {
+                            super::AgentState::Idle
+                        } else {
+                            super::AgentState::Running
+                        },
+                        uptime_seconds: started.elapsed().as_secs(),
+                        active_tasks: active,
+                    };
+                    let response = dispatch(request, status);
                     let _ = write_frame(&mut stream, &response);
                 }
             }
@@ -445,7 +463,10 @@ mod windows_transport {
 }
 
 #[cfg(windows)]
-pub use windows_transport::{acquire_agent_instance, query_agent_status, serve_status_forever};
+pub use windows_transport::{
+    acquire_agent_instance, query_agent_status, serve_status_forever,
+    serve_status_forever_with_active_tasks,
+};
 
 #[cfg(not(windows))]
 pub fn query_agent_status() -> Result<AgentStatus, IpcError> {
@@ -459,6 +480,14 @@ pub fn acquire_agent_instance() -> Result<Option<()>, IpcError> {
 
 #[cfg(not(windows))]
 pub fn serve_status_forever(_started: std::time::Instant) -> Result<(), IpcError> {
+    Err(IpcError::AgentUnavailable)
+}
+
+#[cfg(not(windows))]
+pub fn serve_status_forever_with_active_tasks(
+    _started: std::time::Instant,
+    _active_tasks: std::sync::Arc<std::sync::atomic::AtomicU32>,
+) -> Result<(), IpcError> {
     Err(IpcError::AgentUnavailable)
 }
 

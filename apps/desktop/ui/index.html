@@ -13,7 +13,7 @@
       <header class="header">
         <div>
           <p class="eyebrow">RUSTBACKUP</p>
-          <h1>云端账户</h1>
+          <h1>备份管理</h1>
         </div>
         <div class="header-badges">
           <span id="environment" class="environment">测试环境</span>
@@ -21,40 +21,124 @@
         </div>
       </header>
 
-      <section class="card" aria-labelledby="drive-title">
-        <div class="card-heading">
-          <div class="drive-mark" aria-hidden="true">G</div>
+      <nav class="tabs" aria-label="RustBackup 功能">
+        <button class="tab active" data-panel="tasks" type="button">备份任务</button>
+        <button class="tab" data-panel="history" type="button">历史版本</button>
+        <button class="tab" data-panel="accounts" type="button">云端账户</button>
+        <button class="tab" data-panel="logs" type="button">运行日志</button>
+        <button class="tab" data-panel="settings" type="button">设置</button>
+      </nav>
+
+      <section id="panel-tasks" class="panel active" aria-labelledby="tasks-title">
+        <div class="section-heading">
           <div>
-            <h2 id="drive-title">Google Drive</h2>
+            <h2 id="tasks-title">备份任务</h2>
+            <p class="muted">启用后由独立 Agent 在后台持续运行，关闭此窗口不会停止任务。</p>
+          </div>
+          <button id="create-task" class="primary" type="button">添加任务</button>
+        </div>
+        <p id="task-message" class="message" role="status" aria-live="polite"></p>
+        <div id="task-list" class="task-list" aria-live="polite"></div>
+      </section>
+
+      <section id="panel-history" class="panel" aria-labelledby="history-title" hidden>
+        <div class="section-heading">
+          <div>
+            <h2 id="history-title">历史版本</h2>
+            <p class="muted">本地与 Google Drive 历史按固定 7 天保留；恢复会写入新目录。</p>
+          </div>
+          <select id="history-task" aria-label="选择任务"></select>
+        </div>
+        <p id="history-message" class="message" role="status" aria-live="polite"></p>
+        <div id="history-list" class="history-list"></div>
+      </section>
+
+      <section id="panel-accounts" class="panel" aria-labelledby="account-title" hidden>
+        <div class="section-heading">
+          <div>
+            <h2 id="account-title">云端账户</h2>
             <p class="muted">通过 Google 官方授权连接备份账户</p>
           </div>
         </div>
-
-        <div id="connection" class="connection" role="status" aria-live="polite">
-          正在读取账户状态…
-        </div>
-
-        <div id="secret-setup" class="secret-setup" hidden>
-          <label for="client-secret">OAuth Desktop 客户端密钥</label>
-          <p>从 Google Cloud Console 的 OAuth 客户端详情中复制客户端密钥。密钥只保存到本机 Windows 凭据管理器，不会写入配置文件或发送到聊天。</p>
-          <div class="secret-controls">
-            <input id="client-secret" type="password" autocomplete="off" spellcheck="false" maxlength="1024" />
-            <button id="save-secret" class="secondary" type="button">安全保存</button>
+        <article class="card">
+          <div class="card-heading">
+            <div class="drive-mark" aria-hidden="true">G</div>
+            <div>
+              <h3>Google Drive</h3>
+              <p class="muted">访问权限受 Google OAuth 授权范围限制</p>
+            </div>
           </div>
-        </div>
-
-        <button id="connect" class="primary" type="button" disabled>
-          连接 Google Drive
-        </button>
-        <p id="message" class="message" role="status" aria-live="polite"></p>
+          <div id="connection" class="connection" role="status" aria-live="polite">正在读取账户状态…</div>
+          <div id="secret-setup" class="secret-setup" hidden>
+            <label for="client-secret">OAuth Desktop 客户端密钥</label>
+            <p>密钥只保存到本机 Windows 凭据管理器，不会写入配置文件或发送到聊天。</p>
+            <div class="secret-controls">
+              <input id="client-secret" type="password" autocomplete="off" spellcheck="false" maxlength="1024" />
+              <button id="save-secret" class="secondary" type="button">安全保存</button>
+            </div>
+          </div>
+          <button id="connect" class="primary" type="button" disabled>连接 Google Drive</button>
+          <p id="message" class="message" role="status" aria-live="polite"></p>
+        </article>
+        <aside class="notice">
+          <strong>连接账户不会自动备份。</strong>
+          <span>任务需要你选择源目录、检查目标目录并明确启用。Drive 文件夹只会在已启用任务开始云端备份时创建。</span>
+        </aside>
       </section>
 
-      <aside class="notice">
-        <strong>此步骤只连接账户。</strong>
-        <span>不会启用任务、扫描文件、创建云端文件夹或上传文件。重新授权只清除此设备保存的登录令牌和账号绑定。之后仍需选择并确认测试源目录和专用云端目录。</span>
-      </aside>
+      <section id="panel-logs" class="panel" aria-labelledby="logs-title" hidden>
+        <div class="section-heading">
+          <div>
+            <h2 id="logs-title">运行日志</h2>
+            <p class="muted">日志保存在本机，不记录 OAuth 令牌或客户端密钥。</p>
+          </div>
+          <button id="refresh-logs" class="secondary" type="button">刷新</button>
+        </div>
+        <div id="log-list" class="log-list"></div>
+      </section>
 
-      <footer>Google 授权令牌保存在 Windows 凭据管理器。</footer>
+      <section id="panel-settings" class="panel" aria-labelledby="settings-title" hidden>
+        <div class="section-heading">
+          <div>
+            <h2 id="settings-title">设置</h2>
+            <p class="muted">Agent 以当前 Windows 用户身份运行，不需要管理员权限。</p>
+          </div>
+        </div>
+        <div class="card settings-card">
+          <label class="setting-row"><input id="start-with-windows" type="checkbox" /> 登录 Windows 时启动后台 Agent</label>
+          <label class="setting-row"><input id="start-minimized" type="checkbox" /> 登录启动时隐藏主窗口</label>
+          <label class="setting-row"><input id="minimize-to-tray" type="checkbox" /> 关闭窗口时最小化到系统托盘</label>
+          <button id="save-settings" class="primary" type="button">保存设置</button>
+          <p id="settings-message" class="message" role="status" aria-live="polite"></p>
+        </div>
+        <aside class="notice"><strong>卸载行为</strong><span>卸载程序会移除登录启动项；配置、任务历史、日志和凭据保留在当前用户目录中，便于重新安装后恢复。</span></aside>
+      </section>
+
+      <dialog id="task-editor" class="editor-dialog">
+        <form id="task-form" method="dialog">
+          <div class="section-heading dialog-heading">
+            <div><p class="eyebrow">RUSTBACKUP</p><h2 id="editor-title">编辑备份任务</h2></div>
+            <button id="close-editor" class="icon-button" type="button" aria-label="关闭">×</button>
+          </div>
+          <label>任务名称<input id="task-name" maxlength="100" required /></label>
+          <label>源目录
+            <div class="path-control"><input id="task-source" readonly placeholder="请选择要备份的目录" /><button id="choose-source" class="secondary" type="button">选择目录</button></div>
+          </label>
+          <label>备份方式<select id="task-mode"><option value="local">本地备份</option><option value="cloud">Google Drive</option><option value="dual">本地 + Google Drive</option><option value="bidirectional" disabled>双向同步（暂不支持）</option></select></label>
+          <label>本地目标目录
+            <div class="path-control"><input id="task-destination" readonly /><button id="choose-destination" class="secondary" type="button">选择目录</button></div>
+          </label>
+          <div class="form-grid">
+            <label>运行方式<select id="task-schedule"><option value="realtime">实时监听</option><option value="hourly">按间隔扫描</option><option value="daily">每日扫描</option><option value="manual">手动扫描</option></select></label>
+            <label>扫描间隔（分钟）<input id="task-interval" type="number" min="1" max="10080" /></label>
+          </div>
+          <label>排除规则（每行一项）<textarea id="task-excludes" rows="4"></textarea></label>
+          <p id="editor-message" class="message" role="status" aria-live="polite"></p>
+          <div class="dialog-actions"><button id="cancel-editor" class="secondary" type="button">取消</button><button id="save-task" class="primary" type="submit">保存任务</button></div>
+        </form>
+      </dialog>
+
+      <footer>凭据保存在 Windows 凭据管理器 · 任务配置保存在 %APPDATA%\RustBackup</footer>
     </main>
   </body>
 </html>

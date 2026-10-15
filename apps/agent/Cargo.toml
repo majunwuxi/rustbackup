@@ -11,3 +11,5 @@ backup-local = { path = "../../crates/backup-local" }
 backup-storage = { path = "../../crates/backup-storage" }
 backup-drive = { path = "../../crates/backup-drive" }
 backup-ipc = { path = "../../crates/backup-ipc" }
+serde.workspace = true
+serde_json.workspace = true
