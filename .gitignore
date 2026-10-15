@@ -1,4 +1,5 @@
 /target/
+/apps/desktop/gen/
 *.db
 *.db-shm
 *.db-wal

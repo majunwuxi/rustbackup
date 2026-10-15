@@ -1,0 +1,177 @@
+:root {
+  font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+  color: #19212e;
+  background: #f4f7fb;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 360px;
+  min-height: 100vh;
+  margin: 0;
+}
+
+.shell {
+  width: min(100% - 56px, 660px);
+  margin: 54px auto 32px;
+}
+
+.header,
+.card-heading {
+  display: flex;
+  align-items: center;
+}
+
+.header {
+  justify-content: space-between;
+  margin-bottom: 28px;
+}
+
+.eyebrow {
+  margin: 0 0 8px;
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+}
+
+h1,
+h2,
+p {
+  margin-top: 0;
+}
+
+h1 {
+  margin-bottom: 0;
+  font-size: 28px;
+  letter-spacing: -0.03em;
+}
+
+.environment {
+  padding: 7px 11px;
+  border: 1px solid #cbd8ed;
+  border-radius: 999px;
+  color: #315987;
+  background: #edf4ff;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.card {
+  padding: 28px;
+  border: 1px solid #e1e7ef;
+  border-radius: 18px;
+  background: #fff;
+  box-shadow: 0 12px 36px rgb(28 48 76 / 7%);
+}
+
+.card-heading {
+  gap: 15px;
+  margin-bottom: 24px;
+}
+
+.drive-mark {
+  display: grid;
+  width: 48px;
+  height: 48px;
+  place-items: center;
+  border-radius: 14px;
+  color: #fff;
+  background: #287ae6;
+  font-size: 23px;
+  font-weight: 700;
+}
+
+h2 {
+  margin-bottom: 5px;
+  font-size: 18px;
+}
+
+.muted,
+footer {
+  color: #697789;
+  font-size: 13px;
+}
+
+.muted {
+  margin-bottom: 0;
+}
+
+.connection {
+  min-height: 50px;
+  margin-bottom: 18px;
+  padding: 15px 16px;
+  border-radius: 10px;
+  color: #415167;
+  background: #f4f7fb;
+  font-size: 14px;
+}
+
+.connection.connected {
+  color: #17633f;
+  background: #eaf7ef;
+}
+
+.primary {
+  min-height: 44px;
+  padding: 0 18px;
+  border: 0;
+  border-radius: 10px;
+  color: #fff;
+  background: #1769d2;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.primary:hover:not(:disabled) {
+  background: #1157b4;
+}
+
+.primary:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.message {
+  min-height: 20px;
+  margin: 12px 0 0;
+  color: #9a3b2e;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.notice {
+  display: grid;
+  gap: 5px;
+  margin-top: 18px;
+  padding: 16px 18px;
+  border-left: 3px solid #e2a43b;
+  border-radius: 8px;
+  color: #62502d;
+  background: #fff8e9;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+footer {
+  margin-top: 24px;
+  text-align: center;
+}
+
+@media (max-width: 520px) {
+  .shell {
+    width: min(100% - 32px, 660px);
+    margin-top: 30px;
+  }
+
+  .card {
+    padding: 22px;
+  }
+}

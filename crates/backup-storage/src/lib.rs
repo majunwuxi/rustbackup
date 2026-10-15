@@ -755,7 +755,7 @@ impl StateStore {
         let manifest_id = format!("drive:{file_id}:{source_revision}");
         if self
             .drive_task_binding(task_id)?
-            .map_or(true, |binding| binding.account_id != account_id)
+            .is_none_or(|binding| binding.account_id != account_id)
         {
             return Err(StorageError::DriveAccountMismatch(task_id.to_owned()));
         }
@@ -1275,7 +1275,7 @@ impl HistoryRepository {
             params![file_id],
             |row| row.get(0),
         )?;
-        let is_latest = latest_revision.map_or(true, |latest| source_revision >= latest);
+        let is_latest = latest_revision.is_none_or(|latest| source_revision >= latest);
         if is_latest {
             transaction.execute(
                 "UPDATE file_versions SET is_latest=0 WHERE file_id=?1 AND storage_target='local' \
