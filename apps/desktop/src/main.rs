@@ -10,14 +10,23 @@ const DEFAULT_TASK_ID: &str = "work-documents";
 const DEFAULT_CONFIG: &str = include_str!("../../../config/work-documents.json");
 
 #[cfg(windows)]
-const GOOGLE_OAUTH_CLIENT_ID: &str =
-    "647224236237-f4on9hiol9mf7jbnm365bbv0hvbqvbbf.apps.googleusercontent.com";
+const GOOGLE_OAUTH_CLIENT_ID: &str = match option_env!("RUSTBACKUP_GOOGLE_OAUTH_CLIENT_ID") {
+    Some(client_id) if !client_id.is_empty() => client_id,
+    Some(_) => "",
+    None => "647224236237-f4on9hiol9mf7jbnm365bbv0hvbqvbbf.apps.googleusercontent.com",
+};
+#[cfg(windows)]
+const GOOGLE_OAUTH_CLIENT_SECRET: Option<&str> =
+    option_env!("RUSTBACKUP_GOOGLE_OAUTH_CLIENT_SECRET");
+#[cfg(windows)]
+const GOOGLE_OAUTH_ENVIRONMENT: Option<&str> = option_env!("RUSTBACKUP_GOOGLE_OAUTH_ENVIRONMENT");
 
 #[derive(Debug, Serialize)]
 struct GoogleDriveConnectionStatus {
     connected: bool,
     email: Option<String>,
     client_secret_configured: bool,
+    test_environment: bool,
 }
 
 #[tauri::command]
@@ -28,12 +37,31 @@ fn google_drive_connection_status() -> Result<GoogleDriveConnectionStatus, Strin
         connected: task.destinations.google_drive.account_id.is_some(),
         email: None,
         client_secret_configured: google_oauth_client_secret_configured()?,
+        test_environment: google_oauth_test_environment(),
     })
+}
+
+fn google_oauth_test_environment() -> bool {
+    #[cfg(windows)]
+    {
+        GOOGLE_OAUTH_ENVIRONMENT != Some("production")
+    }
+
+    #[cfg(not(windows))]
+    {
+        true
+    }
 }
 
 fn google_oauth_client_secret_configured() -> Result<bool, String> {
     #[cfg(windows)]
     {
+        if let Some(secret) = GOOGLE_OAUTH_CLIENT_SECRET {
+            validate_google_oauth_client_secret(secret)
+                .map_err(|_| "OAuth 发布构建配置无效".to_owned())?;
+            return Ok(true);
+        }
+
         use backup_drive::{CredentialStore, PlatformCredentialStore};
 
         let credentials =
@@ -129,10 +157,16 @@ async fn connect_google_drive_windows(
 
     let platform_credentials =
         PlatformCredentialStore::new().map_err(|_| "Windows 凭据管理器不可用".to_owned())?;
-    let client_secret = platform_credentials
-        .get(&google_oauth_client_secret_key())
-        .map_err(|_| "无法读取 Windows 凭据管理器".to_owned())?
-        .ok_or_else(|| "请先将 OAuth Desktop 客户端密钥保存到 Windows 凭据管理器。".to_owned())?;
+    let client_secret = match GOOGLE_OAUTH_CLIENT_SECRET {
+        Some(secret) if validate_google_oauth_client_secret(secret).is_ok() => secret.to_owned(),
+        Some(_) => return Err("此应用的 OAuth 构建配置无效。".to_owned()),
+        None => platform_credentials
+            .get(&google_oauth_client_secret_key())
+            .map_err(|_| "无法读取 Windows 凭据管理器".to_owned())?
+            .ok_or_else(|| {
+                "开发构建请先将 OAuth Desktop 客户端密钥保存到 Windows 凭据管理器。".to_owned()
+            })?,
+    };
     let credentials: Arc<dyn CredentialStore> = Arc::new(platform_credentials);
     let oauth_endpoints = OAuthEndpoints::default();
     let oauth = Arc::new(
@@ -169,6 +203,7 @@ async fn connect_google_drive_windows(
         connected: true,
         email: identity.email,
         client_secret_configured: true,
+        test_environment: google_oauth_test_environment(),
     })
 }
 

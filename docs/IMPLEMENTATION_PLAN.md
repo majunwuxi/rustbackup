@@ -42,7 +42,7 @@
 - [ ] 系统托盘、关闭窗口继续后台、Windows 安装包。
 **完成条件：** UI 退出和重启后后台队列持续，安装卸载及凭据处理安全。
 
-**M4 授权切片进度：** 桌面端已有 Tauri 2 授权页，可通过系统浏览器启动 OAuth PKCE loopback 流程；首次配置初始化到 `%APPDATA%\RustBackup\config.json`，只将 Google 账号 subject 写入默认任务绑定。OAuth Desktop 客户端密钥由用户在界面输入并保存到 Windows Credential Manager，与刷新令牌和上传会话 URI 一样不会进入 JSON、SQLite 或日志。连接流程不会启用任务、创建 Drive 文件夹或上传文件；账号切换和后续 Drive 实测入口尚未实现。默认源路径仍为空，任务仍关闭。
+**M4 授权切片进度：** 桌面端已有 Tauri 2 授权页，可通过系统浏览器启动 OAuth PKCE loopback 流程；首次配置初始化到 `%APPDATA%\RustBackup\config.json`，只将 Google 账号 subject 写入默认任务绑定。发行构建可通过 `RUSTBACKUP_GOOGLE_OAUTH_CLIENT_ID` 和 `RUSTBACKUP_GOOGLE_OAUTH_CLIENT_SECRET` 预置 OAuth Desktop 客户端，使普通用户只需点击连接并在 Google 页面授权；`RUSTBACKUP_GOOGLE_OAUTH_ENVIRONMENT=production` 控制正式环境标识，默认仍为测试环境。未预置客户端密钥的开发构建保留 Credential Manager 安全录入入口。客户端密钥按 Google 的公开桌面客户端模型处理，不作为用户密码或防滥用边界；refresh token 与上传会话 URI 仍由 Windows Credential Manager 保护。当前 OAuth 项目仍是测试环境，正式面向公众前需配置生产 OAuth 项目并完成适用的同意屏幕验证。连接流程不会启用任务、创建 Drive 文件夹或上传文件；账号切换和后续 Drive 实测入口尚未实现。默认源路径仍为空，任务仍关闭。
 
 ## M5 稳定化与发布
 - [ ] 集成测试：网络中断、文件并发写入、外接磁盘消失、海量文件、长路径、权限拒绝。

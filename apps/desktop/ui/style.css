@@ -217,6 +217,10 @@ footer {
   line-height: 1.5;
 }
 
+.message.success {
+  color: #17633f;
+}
+
 .notice {
   display: grid;
   gap: 5px;
