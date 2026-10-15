@@ -13,7 +13,8 @@ use thiserror::Error;
 const INITIAL_MIGRATION: &str = include_str!("../../../sql/001_init.sql");
 const HISTORY_MIGRATION: &str = include_str!("../../../sql/002_history.sql");
 const DRIVE_MIGRATION: &str = include_str!("../../../sql/003_drive.sql");
-const SCHEMA_VERSION: i64 = 3;
+const DRIVE_RETENTION_MIGRATION: &str = include_str!("../../../sql/004_drive_retention.sql");
+const SCHEMA_VERSION: i64 = 4;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 type IndexedFileRow = (i64, i64, String, Option<i64>, Option<String>);
 
@@ -262,6 +263,13 @@ impl StateStore {
         if version == 2 {
             let transaction = connection.unchecked_transaction()?;
             transaction.execute_batch(DRIVE_MIGRATION)?;
+            transaction.pragma_update(None, "user_version", 3_i64)?;
+            transaction.commit()?;
+            version = 3;
+        }
+        if version == 3 {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute_batch(DRIVE_RETENTION_MIGRATION)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -826,7 +834,9 @@ impl StateStore {
         let mut statement = self.connection.prepare(
             "SELECT manifest_id,task_id,file_id,source_revision,drive_file_id,account_id,relative_path_key, \
              display_relative_path,content_hash,size_bytes,created_at_ms FROM drive_history_manifests \
-             WHERE task_id=?1 AND file_id=?2 AND status='recoverable' ORDER BY source_revision DESC",
+             WHERE task_id=?1 AND file_id=?2 AND status='recoverable' \
+             AND NOT EXISTS(SELECT 1 FROM drive_history_gc_claims c WHERE c.manifest_id=drive_history_manifests.manifest_id) \
+             ORDER BY source_revision DESC",
         )?;
         let rows = statement.query_map(params![task_id, file_id], |row| {
             let size: i64 = row.get(9)?;
@@ -849,6 +859,94 @@ impl StateStore {
             .map_err(StorageError::from)
     }
 
+    /// Claims expired cloud history for deletion. A claim and restore start use
+    /// immediate transactions so only one operation can own a manifest at a time.
+    pub fn claim_expired_drive_history_versions(
+        &mut self,
+        task_id: &str,
+        cutoff_unix_ms: i64,
+        reclaim_before_unix_ms: i64,
+        now_unix_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<DriveHistoryVersion>, StorageError> {
+        validate_task_id(task_id)?;
+        if cutoff_unix_ms < 0
+            || reclaim_before_unix_ms < 0
+            || now_unix_ms < 0
+            || reclaim_before_unix_ms > now_unix_ms
+            || limit == 0
+            || limit > 256
+        {
+            return Err(StorageError::InvalidRetentionCutoff);
+        }
+        let limit = i64::try_from(limit).map_err(|_| StorageError::CountOverflow)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let expired = {
+            let mut statement = transaction.prepare(
+                "SELECT h.manifest_id,h.task_id,h.file_id,h.source_revision,h.drive_file_id,h.account_id, \
+                 h.relative_path_key,h.display_relative_path,h.content_hash,h.size_bytes,h.created_at_ms \
+                 FROM drive_history_manifests h WHERE h.task_id=?1 AND h.status='recoverable' \
+                 AND h.created_at_ms<=?2 \
+                 AND NOT EXISTS(SELECT 1 FROM drive_restore_audit r WHERE r.manifest_id=h.manifest_id AND r.status='running') \
+                 AND NOT EXISTS(SELECT 1 FROM drive_history_gc_claims c WHERE c.manifest_id=h.manifest_id \
+                   AND c.claimed_at_ms>?3) \
+                 ORDER BY h.created_at_ms,h.manifest_id LIMIT ?4",
+            )?;
+            let rows = statement.query_map(
+                params![task_id, cutoff_unix_ms, reclaim_before_unix_ms, limit],
+                drive_history_version_from_row,
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for version in &expired {
+            transaction.execute(
+                "INSERT INTO drive_history_gc_claims(manifest_id,claimed_at_ms) VALUES(?1,?2) \
+                 ON CONFLICT(manifest_id) DO UPDATE SET claimed_at_ms=excluded.claimed_at_ms",
+                params![version.manifest_id, now_unix_ms],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(expired)
+    }
+
+    /// Releases a claim after a Drive error so the next run can retry promptly.
+    pub fn release_drive_history_gc_claim(&self, manifest_id: &str) -> Result<(), StorageError> {
+        self.connection.execute(
+            "DELETE FROM drive_history_gc_claims WHERE manifest_id=?1",
+            params![manifest_id],
+        )?;
+        Ok(())
+    }
+
+    /// Marks an expired remote object removed after Drive confirmed deletion or
+    /// reported that it was already absent. The manifest row remains for audit.
+    pub fn finish_drive_history_gc_delete(
+        &mut self,
+        manifest_id: &str,
+    ) -> Result<(), StorageError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE drive_history_manifests SET status='removed' WHERE manifest_id=?1 \
+             AND status='recoverable' \
+             AND EXISTS(SELECT 1 FROM drive_history_gc_claims c WHERE c.manifest_id=drive_history_manifests.manifest_id) \
+             AND NOT EXISTS(SELECT 1 FROM drive_restore_audit r WHERE r.manifest_id=drive_history_manifests.manifest_id AND r.status='running')",
+            params![manifest_id],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::InvalidJobState(manifest_id.to_owned()));
+        }
+        transaction.execute(
+            "DELETE FROM drive_history_gc_claims WHERE manifest_id=?1",
+            params![manifest_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn drive_history_version(
         &self,
         task_id: &str,
@@ -862,7 +960,8 @@ impl StateStore {
             .query_row(
                 "SELECT manifest_id,task_id,file_id,source_revision,drive_file_id,account_id,relative_path_key, \
                  display_relative_path,content_hash,size_bytes,created_at_ms FROM drive_history_manifests \
-                 WHERE task_id=?1 AND manifest_id=?2 AND status='recoverable'",
+                 WHERE task_id=?1 AND manifest_id=?2 AND status='recoverable' \
+                 AND NOT EXISTS(SELECT 1 FROM drive_history_gc_claims c WHERE c.manifest_id=drive_history_manifests.manifest_id)",
                 params![task_id, manifest_id],
                 |row| {
                     let size: i64 = row.get(9)?;
@@ -886,7 +985,7 @@ impl StateStore {
     }
 
     pub fn begin_drive_restore(
-        &self,
+        &mut self,
         task_id: &str,
         manifest_id: &str,
         destination_directory: &Path,
@@ -897,9 +996,12 @@ impl StateStore {
                 destination_directory.to_path_buf(),
             ));
         }
-        let manifest_exists: bool = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM drive_history_manifests WHERE task_id=?1 AND manifest_id=?2 \
-             AND status='recoverable')",
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let manifest_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM drive_history_manifests h WHERE h.task_id=?1 AND h.manifest_id=?2 \
+             AND h.status='recoverable' AND NOT EXISTS(SELECT 1 FROM drive_history_gc_claims c WHERE c.manifest_id=h.manifest_id))",
             params![task_id, manifest_id],
             |row| row.get(0),
         )?;
@@ -908,11 +1010,12 @@ impl StateStore {
         }
         let restore_id = next_id("drive-restore");
         let now = current_time_ms()?;
-        self.connection.execute(
+        transaction.execute(
             "INSERT INTO drive_restore_audit(restore_id,manifest_id,destination_path,status,started_at_ms) \
              VALUES(?1,?2,?3,'running',?4)",
             params![restore_id, manifest_id, destination_directory.to_string_lossy(), now],
         )?;
+        transaction.commit()?;
         Ok(DriveRestoreReceipt {
             restore_id,
             manifest_id: manifest_id.to_owned(),
@@ -1928,6 +2031,25 @@ fn validate_display_path(display: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
+fn drive_history_version_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<DriveHistoryVersion> {
+    let size: i64 = row.get(9)?;
+    Ok(DriveHistoryVersion {
+        manifest_id: row.get(0)?,
+        task_id: row.get(1)?,
+        file_id: row.get(2)?,
+        source_revision: row.get(3)?,
+        drive_file_id: row.get(4)?,
+        account_id: row.get(5)?,
+        relative_path_key: row.get(6)?,
+        display_relative_path: row.get(7)?,
+        content_hash: row.get(8)?,
+        size_bytes: u64::try_from(size).map_err(|_| rusqlite::Error::InvalidQuery)?,
+        created_at_unix_ms: row.get(10)?,
+    })
+}
+
 fn next_id(prefix: &str) -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1989,17 +2111,17 @@ mod tests {
                 "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN \
              ('files','transfer_jobs','destination_states','history_objects','history_manifests', \
               'history_object_refs','restore_audit','drive_task_bindings','drive_history_manifests', \
-              'drive_restore_audit')",
+              'drive_restore_audit','drive_history_gc_claims')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(table_count, 10);
+        assert_eq!(table_count, 11);
     }
 
     #[test]
-    fn existing_m1_database_is_upgraded_to_m2() {
+    fn existing_m1_database_is_upgraded_through_current_schema() {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch(INITIAL_MIGRATION).unwrap();
         connection
@@ -2017,6 +2139,37 @@ mod tests {
             |row| row.get(0),
         ).unwrap();
         assert!(history_table_exists);
+        let retention_table_exists: bool = store.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drive_history_gc_claims')",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(retention_table_exists);
+    }
+
+    #[test]
+    fn existing_m3_database_is_upgraded_to_drive_retention_schema() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(INITIAL_MIGRATION).unwrap();
+        connection.execute_batch(HISTORY_MIGRATION).unwrap();
+        connection.execute_batch(DRIVE_MIGRATION).unwrap();
+        connection
+            .pragma_update(None, "user_version", 3_i64)
+            .unwrap();
+
+        let store = StateStore::from_connection(connection).unwrap();
+        let version: i64 = store
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        let retention_table_exists: bool = store.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drive_history_gc_claims')",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(retention_table_exists);
     }
 
     #[test]
@@ -2144,7 +2297,7 @@ mod tests {
         let restore_destination = temp.path().join("cloud-restore");
         let restore_id;
         {
-            let store = StateStore::open(&database).unwrap();
+            let mut store = StateStore::open(&database).unwrap();
             store.register_task("task", "test", true).unwrap();
             let run = store.begin_backup_run("task").unwrap();
             let indexed = store
@@ -2193,6 +2346,107 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "failed");
+    }
+
+    #[test]
+    fn drive_history_retention_respects_expiry_active_restores_and_gc_claims() {
+        let mut store = new_store();
+        store.register_task("task", "test", true).unwrap();
+        let run = store.begin_backup_run("task").unwrap();
+        let indexed = store
+            .record_file_seen(
+                "task",
+                &run,
+                observation("note.txt", "note.txt", 4, 1, HASH_A),
+            )
+            .unwrap();
+        store
+            .bind_drive_task(&DriveTaskBinding {
+                task_id: "task".to_owned(),
+                account_id: "account-1".to_owned(),
+                root_folder_id: "root-1".to_owned(),
+                task_folder_id: "task-1".to_owned(),
+                history_folder_id: "history-1".to_owned(),
+                folder_name: "Work".to_owned(),
+            })
+            .unwrap();
+        store
+            .record_drive_history_version(DriveHistoryRecord {
+                task_id: "task",
+                file_id: indexed.file_id,
+                source_revision: 1,
+                drive_file_id: "remote-history",
+                account_id: "account-1",
+                relative_path_key: "note.txt",
+                display_relative_path: "note.txt",
+                content_hash: HASH_A,
+                size_bytes: 4,
+                created_at_unix_ms: 100,
+            })
+            .unwrap();
+        let restore_path = std::env::temp_dir().join("rustbackup-drive-retention-restore");
+        let active_restore = store
+            .begin_drive_restore("task", "drive:1:1", &restore_path)
+            .unwrap();
+        assert!(store
+            .claim_expired_drive_history_versions("task", 100, 199, 200, 10)
+            .unwrap()
+            .is_empty());
+        store
+            .finish_drive_restore(&active_restore.restore_id, false, Some("test complete"))
+            .unwrap();
+
+        let claimed = store
+            .claim_expired_drive_history_versions("task", 100, 0, 200, 10)
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert!(store
+            .drive_history_version("task", "drive:1:1")
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            store.begin_drive_restore("task", "drive:1:1", &restore_path),
+            Err(StorageError::VersionNotRecoverable(_))
+        ));
+        assert!(store
+            .claim_expired_drive_history_versions("task", 100, 199, 201, 10)
+            .unwrap()
+            .is_empty());
+
+        let reclaimed = store
+            .claim_expired_drive_history_versions("task", 100, 201, 300, 10)
+            .unwrap();
+        assert_eq!(reclaimed.len(), 1);
+        store.release_drive_history_gc_claim("drive:1:1").unwrap();
+        let restore = store
+            .begin_drive_restore("task", "drive:1:1", &restore_path)
+            .unwrap();
+        store
+            .finish_drive_restore(&restore.restore_id, false, Some("test complete"))
+            .unwrap();
+
+        let claimed = store
+            .claim_expired_drive_history_versions("task", 100, 0, 400, 10)
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        store.finish_drive_history_gc_delete("drive:1:1").unwrap();
+        assert!(store
+            .drive_history_version("task", "drive:1:1")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .list_drive_history_versions("task", indexed.file_id)
+            .unwrap()
+            .is_empty());
+        let status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM drive_history_manifests WHERE manifest_id='drive:1:1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "removed");
     }
 
     #[test]

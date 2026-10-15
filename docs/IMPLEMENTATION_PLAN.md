@@ -19,7 +19,7 @@
 
 ## M2 7 天历史与恢复
 - [x] 历史对象仓库、manifest 和引用关系；写入完整后才记为 recoverable。
-- [x] 最新有效版本永保留，其他版本到期后做引用检查 GC。
+- [x] 最新有效版本永保留，其他本地版本严格按固定 7 天到期并做引用检查 GC。
 - [x] 恢复到新目录为默认；覆盖恢复需显式确认；记录恢复审计。
 **完成条件：** 能恢复不同历史版本，GC 不误删最新/引用中对象。
 
@@ -30,10 +30,11 @@
 - [x] Drive 专属目录创建与稳定 folder ID / file ID 映射。
 - [x] Upload（可续传）、网络/配额重试、会话恢复/失效重建、重复上传对账。
 - [x] 云端历史对象与 manifest（与本地备份独立提交）；云端恢复下载。
+- [x] 本地与云端历史统一固定保留 7 天；云端 GC 校验 manifest 标记和托管父目录，并保护进行中的恢复。
 - [x] 未授权时本地分支照常运行，整体状态 partial/waiting_auth。
 **完成条件：** 测试账号 + 测试专用目录验证上传、更新、重试与恢复；无权限越界。
 
-**M3 交付记录：** `backup-drive` 实现桌面 OAuth authorization code + PKCE loopback、账号身份查询、刷新令牌与上传会话 URI 的 Windows Credential Manager 存储，以及受 `drive.file` scope 限制的 Drive v3 客户端。目录和文件以私有 `appProperties` 标记并按 ID 复用；上传通过 resumable session 分块，配额/网络退避、重启续传、失效重建及不确定完成对账均覆盖本机模拟服务测试。`backup-local::backup_once_with_drive` 先完成本地分支，再独立提交 Drive 目标状态；更新前把旧云端文件复制到任务历史目录，cloud manifest 存在 SQLite v3 的独立表中。云端恢复先下载并校验 BLAKE3，再将完整目录原子发布到新的目标目录并记录审计。未授权时返回 `waiting_auth`，保留本地成果。所有自动测试使用临时文件和 loopback 模拟 API；按项目路径安全要求未连接真实 Google 账号，因此 M3 的测试账号/专用目录验收条件仍待人工完成，不能据此标记整项 M3 验收完成。
+**M3 交付记录：** `backup-drive` 实现桌面 OAuth authorization code + PKCE loopback、账号身份查询、刷新令牌与上传会话 URI 的 Windows Credential Manager 存储，以及受 `drive.file` scope 限制的 Drive v3 客户端。目录和文件以私有 `appProperties` 标记并按 ID 复用；上传通过 resumable session 分块，配额/网络退避、重启续传、失效重建及不确定完成对账均覆盖本机模拟服务测试。`backup-local::backup_once_with_drive` 先完成本地分支，再独立提交 Drive 目标状态；更新前把旧云端文件复制到任务历史目录，cloud manifest 存在 SQLite v3 的独立表中。SQLite v4 增加云端 GC 租约；本地和云端历史都固定保留 7 天，云端清理前核对账号、历史父目录和全部 manifest 标记，恢复中的副本不会被删除。云端恢复先下载并校验 BLAKE3，再将完整目录原子发布到新的目标目录并记录审计。未授权时返回 `waiting_auth`，保留本地成果。所有自动测试使用临时文件和 loopback 模拟 API；按项目路径安全要求未连接真实 Google 账号，因此 M3 的测试账号/专用目录验收条件仍待人工完成，不能据此标记整项 M3 验收完成。
 
 ## M4 Agent + Windows GUI
 - [ ] 独立 Agent 登录后自启动、单实例、用户态；安全 Named Pipes IPC。

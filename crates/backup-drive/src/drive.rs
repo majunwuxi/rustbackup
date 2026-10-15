@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
+use backup_storage::DriveHistoryVersion;
+
 use crate::{CredentialStore, OAuthClient, OAuthError};
 
 const DRIVE_API: &str = "https://www.googleapis.com/drive/v3";
@@ -328,6 +330,78 @@ impl DriveClient {
             content_hash,
             size_bytes,
         })
+    }
+
+    /// Deletes only a history file whose private markers and parent folder
+    /// still match the local manifest. The current file is never eligible here.
+    pub fn delete_history_version(
+        &self,
+        version: &DriveHistoryVersion,
+        history_folder_id: &str,
+    ) -> Result<bool, DriveError> {
+        if version.account_id != self.account_id
+            || !valid_identifier(&version.task_id)
+            || version.file_id <= 0
+            || version.source_revision <= 0
+            || !valid_identifier(&version.drive_file_id)
+            || !valid_identifier(history_folder_id)
+            || version.content_hash.len() != 64
+            || !version
+                .content_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(DriveError::InvalidConfiguration);
+        }
+        let Some(remote) = self.get_file(&version.drive_file_id)? else {
+            return Ok(false);
+        };
+        let properties = &remote.app_properties;
+        let expected_revision_marker = format!("{}:{}", version.file_id, version.source_revision);
+        let matches_manifest = remote.id == version.drive_file_id
+            && remote
+                .parents
+                .iter()
+                .any(|parent| parent == history_folder_id)
+            && properties
+                .get("rb_role")
+                .is_some_and(|value| value == "history")
+            && properties
+                .get("rb_task")
+                .is_some_and(|value| value == &version.task_id)
+            && properties
+                .get("rb_file")
+                .is_some_and(|value| value == &version.file_id.to_string())
+            && properties
+                .get("rb_revision")
+                .is_some_and(|value| value == &version.source_revision.to_string())
+            && properties
+                .get("rb_version")
+                .is_some_and(|value| value == &expected_revision_marker)
+            && properties
+                .get("rb_hash")
+                .is_some_and(|value| value.eq_ignore_ascii_case(&version.content_hash))
+            && properties
+                .get("rb_size")
+                .and_then(|value| value.parse::<u64>().ok())
+                == Some(version.size_bytes);
+        if !matches_manifest {
+            return Err(DriveError::InvalidResponse);
+        }
+
+        let url = format!(
+            "{}/files/{}",
+            self.api_root(),
+            encode_path_segment(&version.drive_file_id)
+        );
+        let response = self.api_response("DELETE", &url, None)?;
+        if response.status == 404 {
+            return Ok(false);
+        }
+        if !(200..300).contains(&response.status) {
+            return Err(status_error(&response));
+        }
+        Ok(true)
     }
 
     /// Resumable one-way upload. The session URI is kept in the OS credential
@@ -1370,6 +1444,98 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["remote-a", "remote-b"]
         );
+    }
+
+    #[test]
+    fn history_deletion_checks_manifest_markers_and_parent_folder() {
+        let version = DriveHistoryVersion {
+            manifest_id: "drive:5:2".to_owned(),
+            task_id: "task-1".to_owned(),
+            file_id: 5,
+            source_revision: 2,
+            drive_file_id: "history-file".to_owned(),
+            account_id: "account-123".to_owned(),
+            relative_path_key: "docs/readme.txt".to_owned(),
+            display_relative_path: "Docs/Readme.txt".to_owned(),
+            content_hash: "a".repeat(64),
+            size_bytes: 12,
+            created_at_unix_ms: 1,
+        };
+        let (endpoints, server) = mock_server(2, |index, request| {
+            if index == 0 {
+                assert_eq!(request.method, "GET");
+                MockResponse::json(
+                    200,
+                    serde_json::json!({
+                        "id": "history-file",
+                        "name": "Docs/Readme.txt (revision 2)",
+                        "mimeType": "text/plain",
+                        "size": "12",
+                        "parents": ["history-folder"],
+                        "appProperties": {
+                            "rb_role": "history",
+                            "rb_task": "task-1",
+                            "rb_file": "5",
+                            "rb_revision": "2",
+                            "rb_version": "5:2",
+                            "rb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "rb_size": "12"
+                        }
+                    }),
+                )
+            } else {
+                assert_eq!(request.method, "DELETE");
+                assert!(request.target.starts_with("/drive/v3/files/history-file"));
+                MockResponse::raw(204, Vec::<u8>::new())
+            }
+        });
+        let client = test_client(endpoints, Arc::new(MemoryCredentials::default()));
+        assert!(client
+            .delete_history_version(&version, "history-folder")
+            .unwrap());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn history_deletion_refuses_a_file_outside_the_managed_history_folder() {
+        let version = DriveHistoryVersion {
+            manifest_id: "drive:5:2".to_owned(),
+            task_id: "task-1".to_owned(),
+            file_id: 5,
+            source_revision: 2,
+            drive_file_id: "history-file".to_owned(),
+            account_id: "account-123".to_owned(),
+            relative_path_key: "docs/readme.txt".to_owned(),
+            display_relative_path: "Docs/Readme.txt".to_owned(),
+            content_hash: "a".repeat(64),
+            size_bytes: 12,
+            created_at_unix_ms: 1,
+        };
+        let (endpoints, server) = mock_server(1, |_index, request| {
+            assert_eq!(request.method, "GET");
+            MockResponse::json(
+                200,
+                serde_json::json!({
+                    "id": "history-file",
+                    "parents": ["another-folder"],
+                    "appProperties": {
+                        "rb_role": "history",
+                        "rb_task": "task-1",
+                        "rb_file": "5",
+                        "rb_revision": "2",
+                        "rb_version": "5:2",
+                        "rb_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "rb_size": "12"
+                    }
+                }),
+            )
+        });
+        let client = test_client(endpoints, Arc::new(MemoryCredentials::default()));
+        assert!(matches!(
+            client.delete_history_version(&version, "history-folder"),
+            Err(DriveError::InvalidResponse)
+        ));
+        server.join().unwrap();
     }
 
     #[derive(Default)]

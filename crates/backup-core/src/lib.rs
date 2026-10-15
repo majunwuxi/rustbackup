@@ -8,7 +8,7 @@ pub use config::{
     AppConfig, ApplicationConfig, BackupMode, BackupTask, ConfigError, DestinationsConfig,
     FilterConfig, GoogleDriveDestination, LocalDestination, PermissionDeniedPolicy, SafetyConfig,
     ScheduleConfig, ScheduleType, SourceConfig, SourceUnavailablePolicy, VersioningConfig,
-    CURRENT_SCHEMA_VERSION, MAX_PARALLEL_TRANSFERS,
+    CURRENT_SCHEMA_VERSION, HISTORY_RETENTION_DAYS, MAX_PARALLEL_TRANSFERS,
 };
 pub use filter::{FilterError, FilterSet};
 pub use paths::{

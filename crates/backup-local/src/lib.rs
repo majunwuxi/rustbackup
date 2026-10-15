@@ -10,12 +10,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use backup_core::{
     validate_task_paths, BackupMode, BackupTask, FilterSet, PathValidationError, ScanError,
-    Scanner, SourceUnavailablePolicy,
+    Scanner, SourceUnavailablePolicy, HISTORY_RETENTION_DAYS,
 };
 use backup_drive::{DriveClient, DriveError, OAuthError};
 use backup_storage::{
-    BackupRunStatus, CommitOutcome, DriveHistoryRecord, DriveTaskBinding, FileObservation,
-    HistoryRepository, IndexedFile, IndexedFileState, StateStore, StorageError,
+    BackupRunStatus, CommitOutcome, DriveHistoryRecord, DriveHistoryVersion, DriveTaskBinding,
+    FileObservation, HistoryRepository, IndexedFile, IndexedFileState, StateStore, StorageError,
 };
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tempfile::NamedTempFile;
@@ -27,6 +27,26 @@ pub use drive_restore::{restore_drive_history_version, DriveRestoreError};
 const SNAPSHOT_ATTEMPTS: usize = 3;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_REPORTED_ISSUES: usize = 100;
+const DRIVE_HISTORY_GC_BATCH: usize = 256;
+const DRIVE_HISTORY_GC_LEASE_MS: i64 = 30 * 60 * 1_000;
+
+trait DriveHistoryDeleter {
+    fn delete_history_version(
+        &self,
+        version: &DriveHistoryVersion,
+        history_folder_id: &str,
+    ) -> Result<bool, DriveError>;
+}
+
+impl DriveHistoryDeleter for DriveClient {
+    fn delete_history_version(
+        &self,
+        version: &DriveHistoryVersion,
+        history_folder_id: &str,
+    ) -> Result<bool, DriveError> {
+        DriveClient::delete_history_version(self, version, history_folder_id)
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum LocalBackupError {
@@ -76,6 +96,7 @@ pub struct BackupSummary {
     pub cloud_pending_files: u64,
     pub cloud_uploaded_files: u64,
     pub cloud_history_versions_created: u64,
+    pub cloud_history_versions_removed: u64,
     pub history_versions_removed: u64,
     pub history_objects_removed: u64,
     pub deletion_review_required: bool,
@@ -94,6 +115,7 @@ impl BackupSummary {
             cloud_pending_files: 0,
             cloud_uploaded_files: 0,
             cloud_history_versions_created: 0,
+            cloud_history_versions_removed: 0,
             history_versions_removed: 0,
             history_objects_removed: 0,
             deletion_review_required: false,
@@ -302,44 +324,46 @@ pub fn backup_once_with_drive(
         }
 
         let upload_result = (|| -> Result<_, DriveError> {
-            if let Some(previous) = cloud_state
-                .as_ref()
-                .filter(|state| state.committed_revision > 0)
-            {
-                let previous_drive_id = previous
-                    .target_file_id
-                    .as_deref()
-                    .ok_or(DriveError::InvalidResponse)?;
-                let archived = drive.preserve_current_revision(
-                    &task.id,
-                    file.file_id,
-                    previous.committed_revision,
-                    &file.display_relative_path,
-                    previous_drive_id,
-                    &binding.history_folder_id,
-                )?;
-                let created_at = i64::try_from(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map_err(|_| DriveError::InvalidResponse)?
-                        .as_millis(),
-                )
-                .map_err(|_| DriveError::InvalidResponse)?;
-                store
-                    .record_drive_history_version(DriveHistoryRecord {
-                        task_id: &task.id,
-                        file_id: file.file_id,
-                        source_revision: archived.source_revision,
-                        drive_file_id: &archived.file.id,
-                        account_id: drive.account_id(),
-                        relative_path_key: &file.relative_path_key,
-                        display_relative_path: &file.display_relative_path,
-                        content_hash: &archived.content_hash,
-                        size_bytes: archived.size_bytes,
-                        created_at_unix_ms: created_at,
-                    })
+            if task.versioning.enabled {
+                if let Some(previous) = cloud_state
+                    .as_ref()
+                    .filter(|state| state.committed_revision > 0)
+                {
+                    let previous_drive_id = previous
+                        .target_file_id
+                        .as_deref()
+                        .ok_or(DriveError::InvalidResponse)?;
+                    let archived = drive.preserve_current_revision(
+                        &task.id,
+                        file.file_id,
+                        previous.committed_revision,
+                        &file.display_relative_path,
+                        previous_drive_id,
+                        &binding.history_folder_id,
+                    )?;
+                    let created_at = i64::try_from(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_err(|_| DriveError::InvalidResponse)?
+                            .as_millis(),
+                    )
                     .map_err(|_| DriveError::InvalidResponse)?;
-                summary.cloud_history_versions_created += 1;
+                    store
+                        .record_drive_history_version(DriveHistoryRecord {
+                            task_id: &task.id,
+                            file_id: file.file_id,
+                            source_revision: archived.source_revision,
+                            drive_file_id: &archived.file.id,
+                            account_id: drive.account_id(),
+                            relative_path_key: &file.relative_path_key,
+                            display_relative_path: &file.display_relative_path,
+                            content_hash: &archived.content_hash,
+                            size_bytes: archived.size_bytes,
+                            created_at_unix_ms: created_at,
+                        })
+                        .map_err(|_| DriveError::InvalidResponse)?;
+                    summary.cloud_history_versions_created += 1;
+                }
             }
             let cloud_snapshot =
                 create_stable_snapshot(&mirror_path, &task.destinations.local.path, content_hash)
@@ -408,6 +432,8 @@ pub fn backup_once_with_drive(
         }
     }
 
+    collect_expired_drive_history(store, drive, &binding, task, &mut summary)?;
+
     if summary.cloud_pending_files > 0 && summary.status != "waiting_auth" {
         summary.status = "partial_success".to_owned();
     } else if summary.cloud_pending_files == 0
@@ -421,6 +447,64 @@ pub fn backup_once_with_drive(
     }
     finish_cloud_summary(store, &summary)?;
     Ok(summary)
+}
+
+fn collect_expired_drive_history(
+    store: &mut StateStore,
+    drive: &impl DriveHistoryDeleter,
+    binding: &DriveTaskBinding,
+    task: &BackupTask,
+    summary: &mut BackupSummary,
+) -> Result<(), LocalBackupError> {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok());
+    let Some(now_ms) = now_ms else {
+        summary.add_issue(
+            "Drive history retention cleanup skipped because the system clock is outside the supported range",
+        );
+        return Ok(());
+    };
+    let retention_ms = i64::from(HISTORY_RETENTION_DAYS).saturating_mul(24 * 60 * 60 * 1_000);
+    let cutoff_ms = now_ms.saturating_sub(retention_ms);
+    let reclaim_before_ms = now_ms.saturating_sub(DRIVE_HISTORY_GC_LEASE_MS).max(0);
+
+    loop {
+        let expired = store.claim_expired_drive_history_versions(
+            &task.id,
+            cutoff_ms,
+            reclaim_before_ms,
+            now_ms,
+            DRIVE_HISTORY_GC_BATCH,
+        )?;
+        if expired.is_empty() {
+            break;
+        }
+        let batch_len = expired.len();
+        let mut had_error = false;
+        for version in expired {
+            match drive.delete_history_version(&version, &binding.history_folder_id) {
+                Ok(_) => {
+                    store.finish_drive_history_gc_delete(&version.manifest_id)?;
+                    summary.cloud_history_versions_removed += 1;
+                }
+                Err(error) => {
+                    store.release_drive_history_gc_claim(&version.manifest_id)?;
+                    summary.add_issue(format!(
+                        "{}: Drive history retention cleanup failed: {}",
+                        version.display_relative_path,
+                        drive_error_summary(&error)
+                    ));
+                    had_error = true;
+                }
+            }
+        }
+        if had_error || batch_len < DRIVE_HISTORY_GC_BATCH {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn finish_cloud_summary(
@@ -694,7 +778,7 @@ fn run_reconciliation(
     if scan_complete {
         if let Some(repository) = &history_repository {
             let retention_ms =
-                i64::from(task.versioning.retention_days).saturating_mul(24 * 60 * 60 * 1_000);
+                i64::from(HISTORY_RETENTION_DAYS).saturating_mul(24 * 60 * 60 * 1_000);
             let now_ms = SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()
@@ -1454,6 +1538,7 @@ mod tests {
         PermissionDeniedPolicy, SafetyConfig, ScheduleConfig, ScheduleType, SourceConfig,
         SourceUnavailablePolicy, VersioningConfig,
     };
+    use std::sync::Mutex;
 
     fn task(source: &Path, destination: &Path) -> BackupTask {
         BackupTask {
@@ -1531,6 +1616,127 @@ mod tests {
             b"local copy first"
         );
         assert!(store.drive_task_binding(&dual_task.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn drive_history_retention_deletes_only_versions_past_seven_days() {
+        #[derive(Default)]
+        struct RecordingDeleter(Mutex<Vec<String>>);
+
+        impl DriveHistoryDeleter for RecordingDeleter {
+            fn delete_history_version(
+                &self,
+                version: &DriveHistoryVersion,
+                _history_folder_id: &str,
+            ) -> Result<bool, DriveError> {
+                self.0.lock().unwrap().push(version.drive_file_id.clone());
+                Ok(true)
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut retention_task = task(temp.path(), temp.path());
+        // Runtime cleanup enforces the project policy even for an in-memory task
+        // that bypasses JSON configuration validation.
+        retention_task.versioning.retention_days = 30;
+        let mut store = StateStore::open_in_memory().unwrap();
+        store
+            .register_task(&retention_task.id, &retention_task.name, true)
+            .unwrap();
+        let old_hash = blake3::hash(b"first").to_hex().to_string();
+        let first_run = store.begin_backup_run(&retention_task.id).unwrap();
+        let first = store
+            .record_file_seen(
+                &retention_task.id,
+                &first_run,
+                FileObservation {
+                    relative_path_key: "sample.txt",
+                    display_relative_path: "sample.txt",
+                    size_bytes: 5,
+                    modified_at_unix_ms: 1,
+                    blake3_hex: &old_hash,
+                },
+            )
+            .unwrap();
+        let second_run = store.begin_backup_run(&retention_task.id).unwrap();
+        let second_hash = blake3::hash(b"second").to_hex().to_string();
+        let second = store
+            .record_file_seen(
+                &retention_task.id,
+                &second_run,
+                FileObservation {
+                    relative_path_key: "sample.txt",
+                    display_relative_path: "sample.txt",
+                    size_bytes: 6,
+                    modified_at_unix_ms: 2,
+                    blake3_hex: &second_hash,
+                },
+            )
+            .unwrap();
+        assert_eq!(first.file_id, second.file_id);
+        let binding = DriveTaskBinding {
+            task_id: retention_task.id.clone(),
+            account_id: "test-account".to_owned(),
+            root_folder_id: "root-folder".to_owned(),
+            task_folder_id: "task-folder".to_owned(),
+            history_folder_id: "history-folder".to_owned(),
+            folder_name: "RustBackup/Acceptance".to_owned(),
+        };
+        store.bind_drive_task(&binding).unwrap();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        for (revision, remote_id, hash, size, created_at) in [
+            (
+                1,
+                "remote-old",
+                old_hash.as_str(),
+                5,
+                now_ms - 8 * 24 * 60 * 60 * 1_000,
+            ),
+            (
+                2,
+                "remote-recent",
+                second_hash.as_str(),
+                6,
+                now_ms - 24 * 60 * 60 * 1_000,
+            ),
+        ] {
+            store
+                .record_drive_history_version(DriveHistoryRecord {
+                    task_id: &retention_task.id,
+                    file_id: first.file_id,
+                    source_revision: revision,
+                    drive_file_id: remote_id,
+                    account_id: &binding.account_id,
+                    relative_path_key: "sample.txt",
+                    display_relative_path: "sample.txt",
+                    content_hash: hash,
+                    size_bytes: size,
+                    created_at_unix_ms: created_at,
+                })
+                .unwrap();
+        }
+
+        let deleter = RecordingDeleter::default();
+        let mut summary = BackupSummary::new("retention-run".to_owned());
+        collect_expired_drive_history(
+            &mut store,
+            &deleter,
+            &binding,
+            &retention_task,
+            &mut summary,
+        )
+        .unwrap();
+
+        assert_eq!(*deleter.0.lock().unwrap(), ["remote-old"]);
+        assert_eq!(summary.cloud_history_versions_removed, 1);
+        let retained = store
+            .list_drive_history_versions(&retention_task.id, first.file_id)
+            .unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].source_revision, 2);
     }
 
     #[test]

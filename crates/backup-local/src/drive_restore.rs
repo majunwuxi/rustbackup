@@ -25,7 +25,7 @@ pub enum DriveRestoreError {
 /// Restores one cloud history manifest into a new directory. It validates the
 /// downloaded bytes before publishing the directory and records an audit row.
 pub fn restore_drive_history_version(
-    store: &StateStore,
+    store: &mut StateStore,
     drive: &DriveClient,
     task_id: &str,
     manifest_id: &str,
@@ -154,7 +154,7 @@ mod tests {
 
     #[test]
     fn cloud_restore_refuses_a_different_bound_account() {
-        let store = StateStore::open_in_memory().unwrap();
+        let mut store = StateStore::open_in_memory().unwrap();
         store.register_task("task", "test", true).unwrap();
         let run = store.begin_backup_run("task").unwrap();
         let hash = blake3::hash(b"cloud version").to_hex().to_string();
@@ -216,7 +216,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("restore");
         let result =
-            restore_drive_history_version(&store, &drive, "task", &manifest_id, &destination);
+            restore_drive_history_version(&mut store, &drive, "task", &manifest_id, &destination);
         assert!(matches!(result, Err(DriveRestoreError::WrongAccount)));
         assert!(!destination.exists());
     }

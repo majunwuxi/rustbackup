@@ -11,6 +11,7 @@ use crate::filter::{FilterError, FilterSet};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 pub const MAX_PARALLEL_TRANSFERS: u8 = 16;
+pub const HISTORY_RETENTION_DAYS: u32 = 7;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -172,7 +173,7 @@ pub enum ConfigError {
     DriveDestinationRequired(String),
     #[error("task {0} must have at least one destination")]
     NoDestination(String),
-    #[error("task {0} enables versioning but retention_days is zero")]
+    #[error("task {0} enables versioning but retention_days must be exactly 7")]
     InvalidRetention(String),
     #[error("task {0} uses bidirectional mode, which is unsupported in this release")]
     UnsupportedMode(String),
@@ -247,7 +248,7 @@ pub fn validate_config(config: &AppConfig) -> Result<(), ConfigError> {
         {
             return Err(ConfigError::EmptyDriveFolderName(task.id.clone()));
         }
-        if task.versioning.enabled && task.versioning.retention_days == 0 {
+        if task.versioning.enabled && task.versioning.retention_days != HISTORY_RETENTION_DAYS {
             return Err(ConfigError::InvalidRetention(task.id.clone()));
         }
         FilterSet::new(&task.filters)
@@ -344,6 +345,15 @@ mod tests {
         assert!(matches!(
             parse_config_json(&invalid),
             Err(ConfigError::EmptyEnabledSource(_))
+        ));
+    }
+
+    #[test]
+    fn enabled_versioning_requires_the_project_seven_day_retention() {
+        let invalid = DEFAULT_CONFIG.replace("\"retention_days\": 7", "\"retention_days\": 30");
+        assert!(matches!(
+            parse_config_json(&invalid),
+            Err(ConfigError::InvalidRetention(_))
         ));
     }
 

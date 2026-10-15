@@ -14,21 +14,21 @@
 - `SafetyConfig { propagate_deletions:bool, preserve_deleted_files:bool, verify_before_commit:bool, on_source_unavailable:SourceUnavailablePolicy, on_permission_denied:PermissionDeniedPolicy }`。策略使用 serde snake_case enum，严禁任意字符串。
 
 ## 校验
-- 任务 ID 唯一、合法；versioning enabled 时 retention_days >=1；max_parallel_transfers 在可控范围。
+- 任务 ID 唯一、合法；versioning enabled 时 `retention_days` 必须为 7，作为兼容配置字段保留但不能自定义；本地和云端历史清理均固定按 7 天计算。`keep_latest=true` 的当前有效版本持续保留；max_parallel_transfers 在可控范围。
 - 目标同源或嵌套关系、相同物理文件夹、无法规范化路径、符号链接/重解析点绕过校验均应拒绝或停止任务。
 - `dual` 必须启用两个目标，云端未授权时状态 `waiting_auth`，本地分支仍执行。未授权不能把 whole task 计为 complete。
 - `bidirectional` 首版明确返回 UnsupportedMode。
 - `*.tmp` 和 `~$*` 匹配每层文件名；`.git` 和 `node_modules` 为目录组件精确匹配并剪枝，case insensitive；规则改变只重新扫描，不自动清理旧备份。
 
 ## SQLite 迁移
-`sql/001_init.sql` 初始化 schema v1，`sql/002_history.sql` 升级到 v2，`sql/003_drive.sql` 升级到 v3；代码按 `PRAGMA user_version` 顺序执行嵌入式迁移。关键不变量：
+`sql/001_init.sql` 初始化 schema v1，`sql/002_history.sql` 升级到 v2，`sql/003_drive.sql` 升级到 v3，`sql/004_drive_retention.sql` 升级到 v4；代码按 `PRAGMA user_version` 顺序执行嵌入式迁移。关键不变量：
 - `files` 唯一 `(task_id,relative_path_key)`；key 需规范化 Windows 不区分大小写，保留 display path。
 - `file_versions` 可恢复状态和存储引用；保留最新有效版本。
 - `history_objects` 以 BLAKE3 内容哈希寻址，manifest 记录每个文件版本的安全相对路径；只有对象写入、flush 和哈希/大小校验完成后，manifest 与版本才会转为 `recoverable`。
 - `history_object_refs` 明确连接 manifest 和内容对象；GC 只处理超过任务保留期的非最新版本。对象仍被其他有效版本引用时只移除过期 manifest，不删除对象；进行中的恢复通过 `restore_audit.status='running'` 阻止清理。
 - `restore_audit` 记录版本、目标目录、覆盖确认、开始/完成状态和错误摘要；进程重启时未完成恢复改为失败，之后才可重新参与 GC。
 - `drive_task_bindings` 固定任务与 Google account ID、专属目录 ID 的绑定；账号或 folder ID 变化会暂停云端任务，不会静默改绑。
-- `drive_history_manifests` 保存 Drive 历史副本的 file ID、源 revision、BLAKE3、大小和相对路径；与本地对象仓库/manifest 独立。`drive_restore_audit` 记录云端恢复，进程中断后将进行中记录置为失败。
+- `drive_history_manifests` 保存 Drive 历史副本的 file ID、源 revision、BLAKE3、大小和相对路径；与本地对象仓库/manifest 独立。云端历史副本超过 7 天后进入清理；`drive_history_gc_claims` 以短期租约串行化恢复与删除，进程中断后租约到期可重试。删除前必须匹配当前账号、托管历史父目录和 manifest 对应的全部私有 appProperties；仅删除远端确认成功或已不存在的历史副本后，才将 manifest 标记为 removed。当前 Drive 文件不在历史 manifest 中，因此不会被历史 GC 删除。`drive_restore_audit` 记录云端恢复，进行中的恢复阻止 GC。
 - OAuth refresh token 与 resumable session URI 均属于凭据，只进入 Windows Credential Manager；不写入 JSON、SQLite 或日志。SQLite `transfer_jobs.transfer_session` 不保存可授权上传的 session URI。
 - `transfer_jobs` 每个 `(task_id, relative_path_key, source_revision, destination)` 应幂等；旧 revision 不覆盖新 revision。
 - `destination_states` 各目标拥有自己提交的 revision 与远端 ID；禁止使用整任务一个 bool 表示已备份。
