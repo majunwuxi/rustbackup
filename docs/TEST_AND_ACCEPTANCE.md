@@ -29,9 +29,9 @@ Windows 上进行真实 Drive API 冒烟验收：`cargo run -p rustbackup-deskto
 - [x] 2026-10-15 Release 登录启动模拟：独立 `%TEMP%` `APPDATA`/`LOCALAPPDATA` profile 中，`start_with_windows=false`、`start_minimized=true`、默认任务关闭且源路径为空。以 `--login-startup` 启动后，通过 Windows 原生窗口枚举确认 RustBackup 主窗口隐藏，Agent 状态为 `Idle` 且活动任务数为 0；普通启动仍显示主窗口。未扫描或同步文件。
 - [ ] 人工验收：实际 Windows 登录事件（注销或重启后由 HKCU Run 自动启动）仍待触发验证。手动运行队列的持久化/中断恢复由 SQLite 单测覆盖。
 - [x] Agent IPC 协议单元验收：版本校验、仅状态查询命令、帧长度上限及畸形帧拒绝。
-- [x] 2026-10-15 Windows Agent IPC 冒烟：同一用户成功连续查询状态；启动第二实例后其以退出码 0 结束，原实例仍可响应。隔离 Agent 下以本机名 UNC pipe 路径尝试连接被 Windows 拒绝（Access Denied）；测试配置任务关闭、源路径为空，未扫描或同步文件。
+- [x] 2026-10-15 Windows Agent IPC 冒烟：同一用户成功查询状态；启动第二实例后其以退出码 0 结束，原实例仍可响应。隔离 Agent 下，本机名 UNC pipe 路径连接被拒绝（Access Denied），匿名 Windows token 连接本地 pipe 被拒绝（Win32 error 5）；测试配置任务关闭、源路径为空，未扫描或同步文件。
 - [x] 2026-10-15 M4 隔离 Agent 运行冒烟：Release Agent 使用 `%TEMP%\RustBackup-M4-Agent-269c232e99c345fdb9e9f3743ce8f382` 下临时 APPDATA/LOCALAPPDATA 启动；默认任务保持关闭且源路径为空。状态为 `Idle`、活动任务数为 0；第二实例退出码 0，原实例仍在线；随后已停止测试进程。临时 profile 仅含测试配置、SQLite 状态与日志。
-- [ ] Windows 多进程人工验收：使用另一个 Windows 用户账号及另一台主机分别确认 Named Pipe 连接被拒绝。本机名 UNC 路径拒绝已通过隔离冒烟验证；同用户单实例和状态查询已通过。
+- [ ] Windows 多进程人工验收：使用另一个 Windows 用户账号及另一台主机分别确认 Named Pipe 连接被拒绝。本机名 UNC 路径和匿名 token 拒绝已通过隔离冒烟验证；同用户单实例和状态查询已通过。
 - [x] 2026-10-15 M4 Windows 发布构建：`cargo tauri build --bundles nsis` 成功生成 x64 current-user 安装包；构建前钩子会构建并暂存独立 Agent sidecar。
 - [x] M4 前端静态检查：`node --check apps/desktop/ui/app.js`。
 - [ ] 路径嵌套、junction、symlink 和目录循环被安全阻止。
