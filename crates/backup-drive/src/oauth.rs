@@ -56,7 +56,13 @@ pub enum OAuthError {
     SecureStoreFailure,
     #[error("Google authorization is required")]
     WaitingForAuthorization,
-    #[error("Google authorization request failed ({0})")]
+    #[error("Google {operation} failed (HTTP {status}; provider error: {code})")]
+    ProviderFailure {
+        operation: &'static str,
+        status: u16,
+        code: String,
+    },
+    #[error("Google request failed (HTTP {0})")]
     HttpStatus(u16),
     #[error("Google refresh token is no longer valid")]
     InvalidGrant,
@@ -331,6 +337,7 @@ impl OAuthClient {
     ) -> Result<AccountIdentity, OAuthError> {
         let token: TokenResponse = self.post_form(
             &self.endpoints.token,
+            "authorization code exchange",
             &[
                 ("code", authorization.code.as_str()),
                 ("client_id", &self.client_id),
@@ -395,6 +402,7 @@ impl OAuthClient {
             .ok_or(OAuthError::WaitingForAuthorization)?;
         let token: TokenResponse = match self.post_form(
             &self.endpoints.token,
+            "refresh token exchange",
             &[
                 ("client_id", &self.client_id),
                 ("refresh_token", &refresh_token),
@@ -484,22 +492,22 @@ impl OAuthClient {
     fn post_form<T: for<'de> Deserialize<'de>>(
         &self,
         endpoint: &str,
+        operation: &'static str,
         fields: &[(&str, &str)],
     ) -> Result<T, OAuthError> {
         let response = match self.agent.post(endpoint).send_form(fields) {
             Ok(response) => response,
             Err(ureq::Error::Status(status, response)) => {
-                if status == 400 {
-                    #[derive(Deserialize)]
-                    struct ErrorResponse {
-                        error: Option<String>,
-                    }
-                    let error: Result<ErrorResponse, _> = response.into_json();
-                    if error.ok().and_then(|body| body.error).as_deref() == Some("invalid_grant") {
-                        return Err(OAuthError::InvalidGrant);
-                    }
+                let code = provider_error_code(response).unwrap_or_else(|| "unknown".to_owned());
+                if operation == "refresh token exchange" && status == 400 && code == "invalid_grant"
+                {
+                    return Err(OAuthError::InvalidGrant);
                 }
-                return Err(OAuthError::HttpStatus(status));
+                return Err(OAuthError::ProviderFailure {
+                    operation,
+                    status,
+                    code,
+                });
             }
             Err(ureq::Error::Transport(_)) => return Err(OAuthError::Network),
         };
@@ -518,7 +526,7 @@ impl OAuthClient {
             .get(endpoint)
             .set("Authorization", &format!("Bearer {access_token}"))
             .call()
-            .map_err(map_ureq_error)?;
+            .map_err(|error| map_ureq_error(error, "account identity lookup"))?;
         response
             .into_json()
             .map_err(|_| OAuthError::InvalidResponse)
@@ -570,11 +578,34 @@ fn refresh_expiry_key(account_id: &str) -> String {
     format!("refresh-expiry:{account_id}")
 }
 
-fn map_ureq_error(error: ureq::Error) -> OAuthError {
+fn map_ureq_error(error: ureq::Error, operation: &'static str) -> OAuthError {
     match error {
-        ureq::Error::Status(status, _) => OAuthError::HttpStatus(status),
+        ureq::Error::Status(status, response) => OAuthError::ProviderFailure {
+            operation,
+            status,
+            code: provider_error_code(response).unwrap_or_else(|| "unknown".to_owned()),
+        },
         ureq::Error::Transport(_) => OAuthError::Network,
     }
+}
+
+fn provider_error_code(response: ureq::Response) -> Option<String> {
+    #[derive(Deserialize)]
+    struct ErrorResponse {
+        error: Option<String>,
+    }
+
+    let error: ErrorResponse = response.into_json().ok()?;
+    let code = error.error?;
+    if code.is_empty()
+        || code.len() > 64
+        || !code
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_.-".contains(character))
+    {
+        return None;
+    }
+    Some(code)
 }
 
 fn validate_google_endpoint(
@@ -740,6 +771,49 @@ mod tests {
             callback.join().unwrap(),
             Err(OAuthError::AuthorizationDenied)
         ));
+    }
+
+    #[test]
+    fn authorization_errors_show_provider_code_and_failing_stage_without_details() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            assert!(request.starts_with("POST /token "));
+            write_http_response(
+                &mut stream,
+                400,
+                "application/json",
+                r#"{"error":"invalid_request","error_description":"private response details"}"#,
+            );
+        });
+        let client = OAuthClient {
+            client_id: "desktop-client".to_owned(),
+            endpoints: OAuthEndpoints {
+                authorization: format!("{endpoint}/auth"),
+                token: format!("{endpoint}/token"),
+                userinfo: format!("{endpoint}/userinfo"),
+            },
+            credentials: Arc::new(MemoryCredentials::default()),
+            agent: ureq::AgentBuilder::new().build(),
+            cached: Mutex::new(None),
+        };
+
+        let error = client
+            .complete_authorization(AuthorizationCode {
+                code: "one-time-code".to_owned(),
+                redirect_uri: "http://127.0.0.1:43210".to_owned(),
+                verifier: "v".repeat(64),
+            })
+            .expect_err("provider rejection should be surfaced");
+
+        assert_eq!(
+            error.to_string(),
+            "Google authorization code exchange failed (HTTP 400; provider error: invalid_request)"
+        );
+        assert!(!error.to_string().contains("private response details"));
+        server.join().unwrap();
     }
 
     #[test]
