@@ -927,8 +927,9 @@ fn install_system_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error
     let open = MenuItem::with_id(app, "open", "打开 RustBackup", true, None::<&str>)?;
     let exit = MenuItem::with_id(app, "exit", "退出界面（后台备份继续）", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &exit])?;
-    TrayIconBuilder::new()
+    let tray = TrayIconBuilder::new()
         .icon(icon)
+        .tooltip("RustBackup")
         .menu(&menu)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => show_main_window(app),
@@ -948,6 +949,9 @@ fn install_system_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error
             }
         })
         .build(app)?;
+    // Tauri removes a tray icon when its last handle is dropped. Keep the
+    // handle in managed application state for the lifetime of the app.
+    app.manage(tray);
     Ok(())
 }
 

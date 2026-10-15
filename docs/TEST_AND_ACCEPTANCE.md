@@ -25,7 +25,8 @@ Windows 上进行真实 Drive API 冒烟验收：`cargo run -p rustbackup-deskto
 - [x] M4 隔离桌面/Agent 冒烟：Release 桌面端以 `--login-startup` 在独立 `%TEMP%` profile 启动；默认任务关闭且源路径为空。终止 UI 后 Agent 仍为原 PID/在线，重新启动 UI 后复用同一 Agent；测试结束已停止两个进程。
 - [x] 2026-10-15 NSIS 隔离安装/卸载冒烟：包安装到唯一 `%TEMP%` 目录，桌面端和 Agent 可运行；卸载后安装目录及 HKCU 卸载登记消失，测试 profile 中配置、SQLite 和日志仍保留，`RustBackupAgent` 登录启动值未被创建。
 - [x] 2026-10-15 登录启动/卸载项隔离验收：设置 `start_with_windows=true` 启动桌面端后，HKCU Run 值指向安装目录并携带 `--login-startup`；卸载后启动项和安装目录移除，隔离 profile 配置与 SQLite 保留。
-- [ ] 人工验收：在可交互桌面点窗口关闭后确认隐藏到托盘，并从托盘重新打开/退出 UI；实际 Windows 登录事件仍需人工触发验证。手动运行队列的持久化/中断恢复由 SQLite 单测覆盖。
+- [x] 2026-10-15 Release 托盘隔离交互验收：使用 `%TEMP%\RustBackup-M4-Tray-Recheck-1ad49b590f044c29a7ada5957e389bc4`，`start_with_windows=false`、`minimize_to_tray=true`、默认任务关闭且源路径为空。点击 X 后窗口隐藏，托盘图标可见且能重新打开；选择托盘菜单“退出界面（后台备份继续）”后 UI 进程退出，`rustbackup-agent.exe --status` 返回 `online (Idle)`、活动任务数为 0。此前托盘句柄被过早释放，现已保存在 Tauri 应用状态中。
+- [ ] 人工验收：实际 Windows 登录事件启动桌面端并隐藏窗口仍待触发验证。手动运行队列的持久化/中断恢复由 SQLite 单测覆盖。
 - [x] Agent IPC 协议单元验收：版本校验、仅状态查询命令、帧长度上限及畸形帧拒绝。
 - [x] 2026-10-15 Windows Agent IPC 冒烟：同一用户成功连续查询 3 次状态；启动第二实例后其以退出码 0 结束，原实例仍可响应。Agent 只创建 Named Pipe 和 mutex，未读取配置或访问备份路径。
 - [x] 2026-10-15 M4 隔离 Agent 运行冒烟：Release Agent 使用 `%TEMP%\RustBackup-M4-Agent-269c232e99c345fdb9e9f3743ce8f382` 下临时 APPDATA/LOCALAPPDATA 启动；默认任务保持关闭且源路径为空。状态为 `Idle`、活动任务数为 0；第二实例退出码 0，原实例仍在线；随后已停止测试进程。临时 profile 仅含测试配置、SQLite 状态与日志。
