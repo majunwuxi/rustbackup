@@ -25,12 +25,15 @@
 - 盘符被拔除、D 盘不存在或权限失败时暂停任务，禁止把整个目录误判删除。
 
 ## Google Drive 注意事项
-- Desktop OAuth 2.0 Authorization Code + PKCE，loopback redirect，使用系统浏览器；refresh token 保存在 Windows Credential Manager/DPAPI；禁止日志泄露。
+- Desktop OAuth 2.0 Authorization Code + PKCE，IPv4 loopback redirect；授权 URL 交由 UI 在系统浏览器打开。`drive.file` 与 OIDC `openid email` scope 仅用于应用文件和账号身份；不向任意主机发送访问令牌。
+- refresh token 与 resumable session URI 保存在 Windows Credential Manager；两者均按凭据处理，禁止进入 JSON、SQLite 和日志。访问令牌只驻留内存；无有效授权时返回 `waiting_auth`。
 - 优先受限 `drive.file` scope。首版由应用自己创建专用目录，不保证可浏览任意现有 Drive 目录。
 - Drive 允许同名文件，必须持久化 ID；目录路径到 ID 映射防重复；首次执行前校验绑定账号与文件夹。
 - 支持指数退避、Retry-After、配额/403/429/5xx 分类；离线入队；使用有效期内 resumable session，过期重建。
 - 上传完整性比较：本地 BLAKE3 仅作本地索引；可使用 Drive 提供的适用校验元数据（例如二进制文件的 md5Checksum）或下载验证。不能把 BLAKE3 与 Drive MD5 直接比较。云端未可验证则报告校验范围而非假定强验证。
 - 对未完成或失败上传保留旧云端有效版本；任务重试应具备幂等控制或操作后对账。
+- 更新 Drive 当前文件前先复制旧内容到应用管理的历史文件夹；SQLite `drive_history_manifests` 单独记录云端 file ID、源 revision、hash、大小和相对路径。云端恢复按 BLAKE3 验证后发布到新目录并写入 `drive_restore_audit`。
+- 本机模拟 API 验证 OAuth/上传/恢复协议；连接真实测试账号与专用目录属于人工验收，不在开发或自动测试期间执行。
 
 ## 安全与效率
 - 配置可读写，原子写配置文件，并保留 schema version；状态 SQLite WAL 模式、外键、事务。

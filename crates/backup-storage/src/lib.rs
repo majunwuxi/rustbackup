@@ -12,7 +12,8 @@ use thiserror::Error;
 
 const INITIAL_MIGRATION: &str = include_str!("../../../sql/001_init.sql");
 const HISTORY_MIGRATION: &str = include_str!("../../../sql/002_history.sql");
-const SCHEMA_VERSION: i64 = 2;
+const DRIVE_MIGRATION: &str = include_str!("../../../sql/003_drive.sql");
+const SCHEMA_VERSION: i64 = 3;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 type IndexedFileRow = (i64, i64, String, Option<i64>, Option<String>);
 
@@ -60,6 +61,10 @@ pub enum StorageError {
     InvalidRestoreTarget(PathBuf),
     #[error("retention cutoff is invalid")]
     InvalidRetentionCutoff,
+    #[error("Google Drive account binding changed for task {0}")]
+    DriveAccountMismatch(String),
+    #[error("Google Drive folder binding changed for task {0}")]
+    DriveFolderMismatch(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,6 +82,59 @@ pub struct IndexedFileState {
     pub display_relative_path: String,
     pub size_bytes: Option<u64>,
     pub content_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DestinationState {
+    pub committed_revision: i64,
+    pub target_file_id: Option<String>,
+    pub checksum_info: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DriveTaskBinding {
+    pub task_id: String,
+    pub account_id: String,
+    pub root_folder_id: String,
+    pub task_folder_id: String,
+    pub history_folder_id: String,
+    pub folder_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DriveHistoryVersion {
+    pub manifest_id: String,
+    pub task_id: String,
+    pub file_id: i64,
+    pub source_revision: i64,
+    pub drive_file_id: String,
+    pub account_id: String,
+    pub relative_path_key: String,
+    pub display_relative_path: String,
+    pub content_hash: String,
+    pub size_bytes: u64,
+    pub created_at_unix_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DriveHistoryRecord<'a> {
+    pub task_id: &'a str,
+    pub file_id: i64,
+    pub source_revision: i64,
+    pub drive_file_id: &'a str,
+    pub account_id: &'a str,
+    pub relative_path_key: &'a str,
+    pub display_relative_path: &'a str,
+    pub content_hash: &'a str,
+    pub size_bytes: u64,
+    pub created_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DriveRestoreReceipt {
+    pub restore_id: String,
+    pub manifest_id: String,
+    pub destination_directory: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -197,6 +255,13 @@ impl StateStore {
         if version == 1 {
             let transaction = connection.unchecked_transaction()?;
             transaction.execute_batch(HISTORY_MIGRATION)?;
+            transaction.pragma_update(None, "user_version", 2_i64)?;
+            transaction.commit()?;
+            version = 2;
+        }
+        if version == 2 {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute_batch(DRIVE_MIGRATION)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -222,6 +287,12 @@ impl StateStore {
         transaction.execute(
             "UPDATE restore_audit SET status='failed',finished_at_ms=?1, \
              error_summary=COALESCE(error_summary,'restore interrupted by process exit') \
+             WHERE status='running'",
+            params![current_time_ms()?],
+        )?;
+        transaction.execute(
+            "UPDATE drive_restore_audit SET status='failed',finished_at_ms=?1, \
+             error_summary=COALESCE(error_summary,'cloud restore interrupted by process exit') \
              WHERE status='running'",
             params![current_time_ms()?],
         )?;
@@ -461,6 +532,421 @@ impl StateStore {
         Ok(checksum.flatten())
     }
 
+    pub fn destination_state(
+        &self,
+        file_id: i64,
+        destination: &str,
+    ) -> Result<Option<DestinationState>, StorageError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT committed_revision,target_file_id,checksum_info FROM destination_states \
+                 WHERE file_id=?1 AND destination=?2",
+                params![file_id, destination],
+                |row| {
+                    Ok(DestinationState {
+                        committed_revision: row.get(0)?,
+                        target_file_id: row.get(1)?,
+                        checksum_info: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Returns currently present source files. The caller must still validate
+    /// the corresponding local mirror before reading or uploading it.
+    pub fn indexed_files(&self, task_id: &str) -> Result<Vec<IndexedFileState>, StorageError> {
+        validate_task_id(task_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT file_id,source_revision,relative_path_key,display_relative_path,size_bytes,blake3_hex \
+             FROM files WHERE task_id=?1 AND source_missing=0 ORDER BY relative_path_key",
+        )?;
+        let rows = statement.query_map(params![task_id], |row| {
+            let size: Option<i64> = row.get(4)?;
+            let size_bytes = size
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            Ok(IndexedFileState {
+                file_id: row.get(0)?,
+                source_revision: row.get(1)?,
+                relative_path_key: row.get(2)?,
+                display_relative_path: row.get(3)?,
+                size_bytes,
+                content_hash: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    pub fn drive_task_binding(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<DriveTaskBinding>, StorageError> {
+        validate_task_id(task_id)?;
+        self.connection
+            .query_row(
+                "SELECT task_id,account_id,root_folder_id,task_folder_id,history_folder_id,folder_name \
+                 FROM drive_task_bindings WHERE task_id=?1",
+                params![task_id],
+                |row| {
+                    Ok(DriveTaskBinding {
+                        task_id: row.get(0)?,
+                        account_id: row.get(1)?,
+                        root_folder_id: row.get(2)?,
+                        task_folder_id: row.get(3)?,
+                        history_folder_id: row.get(4)?,
+                        folder_name: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::from)
+    }
+
+    /// Persists Drive account/folder IDs only. OAuth refresh tokens and
+    /// resumable session URLs belong in the OS credential vault.
+    pub fn bind_drive_task(&self, binding: &DriveTaskBinding) -> Result<(), StorageError> {
+        validate_task_id(&binding.task_id)?;
+        for value in [
+            binding.account_id.as_str(),
+            binding.root_folder_id.as_str(),
+            binding.task_folder_id.as_str(),
+            binding.history_folder_id.as_str(),
+        ] {
+            validate_drive_identifier(value)?;
+        }
+        if binding.folder_name.trim().is_empty()
+            || binding.folder_name.len() > 1024
+            || binding.folder_name.chars().any(char::is_control)
+        {
+            return Err(StorageError::InvalidDisplayPath(
+                binding.folder_name.clone(),
+            ));
+        }
+        if let Some(existing) = self.drive_task_binding(&binding.task_id)? {
+            if existing.account_id != binding.account_id {
+                return Err(StorageError::DriveAccountMismatch(binding.task_id.clone()));
+            }
+            if existing.root_folder_id != binding.root_folder_id
+                || existing.task_folder_id != binding.task_folder_id
+                || existing.history_folder_id != binding.history_folder_id
+            {
+                return Err(StorageError::DriveFolderMismatch(binding.task_id.clone()));
+            }
+            self.connection.execute(
+                "UPDATE drive_task_bindings SET folder_name=?2,updated_at=datetime('now') WHERE task_id=?1",
+                params![binding.task_id, binding.folder_name],
+            )?;
+            return Ok(());
+        }
+        self.connection.execute(
+            "INSERT INTO drive_task_bindings(task_id,account_id,root_folder_id,task_folder_id,history_folder_id,folder_name,created_at,updated_at) \
+             VALUES(?1,?2,?3,?4,?5,?6,datetime('now'),datetime('now'))",
+            params![
+                binding.task_id,
+                binding.account_id,
+                binding.root_folder_id,
+                binding.task_folder_id,
+                binding.history_folder_id,
+                binding.folder_name
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn enqueue_drive_upload(
+        &self,
+        file_id: i64,
+        revision: i64,
+    ) -> Result<String, StorageError> {
+        let job_id = format!("{file_id}:{revision}:drive:upload");
+        self.connection.execute(
+            "INSERT INTO transfer_jobs(job_id,file_id,source_revision,destination,operation,status,created_at,updated_at) \
+             VALUES(?1,?2,?3,'drive','upload','pending',datetime('now'),datetime('now')) \
+             ON CONFLICT(file_id,source_revision,destination,operation) DO UPDATE SET \
+             status=CASE WHEN transfer_jobs.status='failed' OR \
+             (transfer_jobs.status='retry_wait' AND COALESCE(transfer_jobs.next_retry_at,'')<=datetime('now')) \
+             THEN 'pending' ELSE transfer_jobs.status END, \
+             next_retry_at=NULL,last_error=NULL,updated_at=datetime('now')",
+            params![job_id, file_id, revision],
+        )?;
+        Ok(job_id)
+    }
+
+    pub fn commit_drive_upload_if_current(
+        &mut self,
+        job_id: &str,
+        file_id: i64,
+        revision: i64,
+        checksum_info: &str,
+        target_drive_file_id: &str,
+    ) -> Result<CommitOutcome, StorageError> {
+        validate_drive_identifier(target_drive_file_id)?;
+        if checksum_info.is_empty() || checksum_info.len() > 1024 || checksum_info.contains('\n') {
+            return Err(StorageError::InvalidHash);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !is_job_current(&transaction, job_id, file_id, revision)? {
+            transaction.execute(
+                "UPDATE transfer_jobs SET status='failed',last_error='stale source revision superseded',updated_at=datetime('now') WHERE job_id=?1",
+                params![job_id],
+            )?;
+            transaction.commit()?;
+            return Ok(CommitOutcome::Stale);
+        }
+        transaction.execute(
+            "INSERT INTO destination_states(file_id,destination,committed_revision,target_file_id,checksum_info,last_error,updated_at) \
+             VALUES(?1,'drive',?2,?3,?4,NULL,datetime('now')) \
+             ON CONFLICT(file_id,destination) DO UPDATE SET committed_revision=excluded.committed_revision, \
+             target_file_id=excluded.target_file_id,checksum_info=excluded.checksum_info,last_error=NULL,updated_at=datetime('now') \
+             WHERE destination_states.committed_revision<=excluded.committed_revision",
+            params![file_id, revision, target_drive_file_id, checksum_info],
+        )?;
+        transaction.execute(
+            "UPDATE transfer_jobs SET status='succeeded',transfer_session=NULL,last_error=NULL,updated_at=datetime('now') WHERE job_id=?1",
+            params![job_id],
+        )?;
+        transaction.commit()?;
+        Ok(CommitOutcome::Committed)
+    }
+
+    pub fn record_drive_history_version(
+        &self,
+        record: DriveHistoryRecord<'_>,
+    ) -> Result<DriveHistoryVersion, StorageError> {
+        let DriveHistoryRecord {
+            task_id,
+            file_id,
+            source_revision,
+            drive_file_id,
+            account_id,
+            relative_path_key,
+            display_relative_path,
+            content_hash,
+            size_bytes,
+            created_at_unix_ms,
+        } = record;
+        validate_task_id(task_id)?;
+        validate_drive_identifier(drive_file_id)?;
+        validate_drive_identifier(account_id)?;
+        validate_path_key(relative_path_key)?;
+        validate_display_path(display_relative_path)?;
+        validate_hash(content_hash)?;
+        if source_revision <= 0 || created_at_unix_ms < 0 {
+            return Err(StorageError::VersionConflict(format!(
+                "{file_id}:{source_revision}"
+            )));
+        }
+        let size = i64::try_from(size_bytes).map_err(|_| StorageError::CountOverflow)?;
+        let manifest_id = format!("drive:{file_id}:{source_revision}");
+        if self
+            .drive_task_binding(task_id)?
+            .map_or(true, |binding| binding.account_id != account_id)
+        {
+            return Err(StorageError::DriveAccountMismatch(task_id.to_owned()));
+        }
+        let existing = self
+            .connection
+            .query_row(
+                "SELECT drive_file_id,account_id,relative_path_key,display_relative_path,content_hash,size_bytes,created_at_ms \
+                 FROM drive_history_manifests WHERE manifest_id=?1",
+                params![manifest_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let stored_created_at = if let Some(existing) = existing {
+            if existing.0 != drive_file_id
+                || existing.1 != account_id
+                || existing.2 != relative_path_key
+                || existing.3 != display_relative_path
+                || existing.4 != content_hash.to_ascii_lowercase()
+                || existing.5 != size
+            {
+                return Err(StorageError::VersionConflict(manifest_id));
+            }
+            existing.6
+        } else {
+            self.connection.execute(
+                "INSERT INTO drive_history_manifests(manifest_id,task_id,file_id,source_revision,drive_file_id,account_id, \
+                 relative_path_key,display_relative_path,content_hash,size_bytes,created_at_ms,status) \
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'recoverable')",
+                params![
+                    manifest_id,
+                    task_id,
+                    file_id,
+                    source_revision,
+                    drive_file_id,
+                    account_id,
+                    relative_path_key,
+                    display_relative_path,
+                    content_hash.to_ascii_lowercase(),
+                    size,
+                    created_at_unix_ms
+                ],
+            )?;
+            created_at_unix_ms
+        };
+        Ok(DriveHistoryVersion {
+            manifest_id,
+            task_id: task_id.to_owned(),
+            file_id,
+            source_revision,
+            drive_file_id: drive_file_id.to_owned(),
+            account_id: account_id.to_owned(),
+            relative_path_key: relative_path_key.to_owned(),
+            display_relative_path: display_relative_path.to_owned(),
+            content_hash: content_hash.to_ascii_lowercase(),
+            size_bytes,
+            created_at_unix_ms: stored_created_at,
+        })
+    }
+
+    pub fn list_drive_history_versions(
+        &self,
+        task_id: &str,
+        file_id: i64,
+    ) -> Result<Vec<DriveHistoryVersion>, StorageError> {
+        validate_task_id(task_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT manifest_id,task_id,file_id,source_revision,drive_file_id,account_id,relative_path_key, \
+             display_relative_path,content_hash,size_bytes,created_at_ms FROM drive_history_manifests \
+             WHERE task_id=?1 AND file_id=?2 AND status='recoverable' ORDER BY source_revision DESC",
+        )?;
+        let rows = statement.query_map(params![task_id, file_id], |row| {
+            let size: i64 = row.get(9)?;
+            let size_bytes = u64::try_from(size).map_err(|_| rusqlite::Error::InvalidQuery)?;
+            Ok(DriveHistoryVersion {
+                manifest_id: row.get(0)?,
+                task_id: row.get(1)?,
+                file_id: row.get(2)?,
+                source_revision: row.get(3)?,
+                drive_file_id: row.get(4)?,
+                account_id: row.get(5)?,
+                relative_path_key: row.get(6)?,
+                display_relative_path: row.get(7)?,
+                content_hash: row.get(8)?,
+                size_bytes,
+                created_at_unix_ms: row.get(10)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    pub fn drive_history_version(
+        &self,
+        task_id: &str,
+        manifest_id: &str,
+    ) -> Result<Option<DriveHistoryVersion>, StorageError> {
+        validate_task_id(task_id)?;
+        if manifest_id.len() > 128 || !manifest_id.starts_with("drive:") {
+            return Ok(None);
+        }
+        self.connection
+            .query_row(
+                "SELECT manifest_id,task_id,file_id,source_revision,drive_file_id,account_id,relative_path_key, \
+                 display_relative_path,content_hash,size_bytes,created_at_ms FROM drive_history_manifests \
+                 WHERE task_id=?1 AND manifest_id=?2 AND status='recoverable'",
+                params![task_id, manifest_id],
+                |row| {
+                    let size: i64 = row.get(9)?;
+                    Ok(DriveHistoryVersion {
+                        manifest_id: row.get(0)?,
+                        task_id: row.get(1)?,
+                        file_id: row.get(2)?,
+                        source_revision: row.get(3)?,
+                        drive_file_id: row.get(4)?,
+                        account_id: row.get(5)?,
+                        relative_path_key: row.get(6)?,
+                        display_relative_path: row.get(7)?,
+                        content_hash: row.get(8)?,
+                        size_bytes: u64::try_from(size).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        created_at_unix_ms: row.get(10)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::from)
+    }
+
+    pub fn begin_drive_restore(
+        &self,
+        task_id: &str,
+        manifest_id: &str,
+        destination_directory: &Path,
+    ) -> Result<DriveRestoreReceipt, StorageError> {
+        validate_task_id(task_id)?;
+        if !destination_directory.is_absolute() {
+            return Err(StorageError::InvalidRestoreDestination(
+                destination_directory.to_path_buf(),
+            ));
+        }
+        let manifest_exists: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM drive_history_manifests WHERE task_id=?1 AND manifest_id=?2 \
+             AND status='recoverable')",
+            params![task_id, manifest_id],
+            |row| row.get(0),
+        )?;
+        if !manifest_exists {
+            return Err(StorageError::VersionNotRecoverable(manifest_id.to_owned()));
+        }
+        let restore_id = next_id("drive-restore");
+        let now = current_time_ms()?;
+        self.connection.execute(
+            "INSERT INTO drive_restore_audit(restore_id,manifest_id,destination_path,status,started_at_ms) \
+             VALUES(?1,?2,?3,'running',?4)",
+            params![restore_id, manifest_id, destination_directory.to_string_lossy(), now],
+        )?;
+        Ok(DriveRestoreReceipt {
+            restore_id,
+            manifest_id: manifest_id.to_owned(),
+            destination_directory: destination_directory.to_path_buf(),
+        })
+    }
+
+    pub fn finish_drive_restore(
+        &self,
+        restore_id: &str,
+        succeeded: bool,
+        error_summary: Option<&str>,
+    ) -> Result<(), StorageError> {
+        if error_summary.is_some_and(|error| error.len() > 2048 || error.contains('\n')) {
+            return Err(StorageError::InvalidDisplayPath(
+                "restore error summary is invalid".to_owned(),
+            ));
+        }
+        let changed = self.connection.execute(
+            "UPDATE drive_restore_audit SET status=?2,finished_at_ms=?3,error_summary=?4 \
+             WHERE restore_id=?1 AND status='running'",
+            params![
+                restore_id,
+                if succeeded { "succeeded" } else { "failed" },
+                current_time_ms()?,
+                error_summary
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::InvalidJobState(restore_id.to_owned()));
+        }
+        Ok(())
+    }
+
     pub fn has_recoverable_history_version(
         &self,
         file_id: i64,
@@ -514,7 +1000,7 @@ impl StateStore {
         }
         transaction.execute(
             "INSERT INTO destination_states(file_id,destination,committed_revision,last_error,updated_at) \
-             SELECT file_id,'local',0,?2,datetime('now') FROM transfer_jobs WHERE job_id=?1 \
+             SELECT file_id,destination,0,?2,datetime('now') FROM transfer_jobs WHERE job_id=?1 \
              ON CONFLICT(file_id,destination) DO UPDATE SET last_error=excluded.last_error,updated_at=datetime('now')",
             params![job_id, error],
         )?;
@@ -1399,6 +1885,19 @@ fn validate_task_id(task_id: &str) -> Result<(), StorageError> {
     }
 }
 
+fn validate_drive_identifier(value: &str) -> Result<(), StorageError> {
+    if !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        Ok(())
+    } else {
+        Err(StorageError::InvalidTaskId(value.to_owned()))
+    }
+}
+
 fn validate_hash(hash: &str) -> Result<(), StorageError> {
     if hash.len() == 64
         && hash
@@ -1489,13 +1988,14 @@ mod tests {
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN \
              ('files','transfer_jobs','destination_states','history_objects','history_manifests', \
-              'history_object_refs','restore_audit')",
+              'history_object_refs','restore_audit','drive_task_bindings','drive_history_manifests', \
+              'drive_restore_audit')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(table_count, 7);
+        assert_eq!(table_count, 10);
     }
 
     #[test]
@@ -1517,6 +2017,182 @@ mod tests {
             |row| row.get(0),
         ).unwrap();
         assert!(history_table_exists);
+    }
+
+    #[test]
+    fn drive_binding_history_and_upload_state_are_persisted_separately() {
+        let mut store = new_store();
+        store.register_task("task", "test", true).unwrap();
+        let run = store.begin_backup_run("task").unwrap();
+        let indexed = store
+            .record_file_seen(
+                "task",
+                &run,
+                observation("report.txt", "Report.txt", 3, 1, HASH_A),
+            )
+            .unwrap();
+        let binding = DriveTaskBinding {
+            task_id: "task".to_owned(),
+            account_id: "account-1".to_owned(),
+            root_folder_id: "root-1".to_owned(),
+            task_folder_id: "folder-1".to_owned(),
+            history_folder_id: "history-1".to_owned(),
+            folder_name: "Work".to_owned(),
+        };
+        store.bind_drive_task(&binding).unwrap();
+        assert_eq!(
+            store.drive_task_binding("task").unwrap(),
+            Some(binding.clone())
+        );
+
+        let job = store
+            .enqueue_drive_upload(indexed.file_id, indexed.source_revision)
+            .unwrap();
+        store.start_job(&job).unwrap();
+        assert_eq!(
+            store
+                .commit_drive_upload_if_current(
+                    &job,
+                    indexed.file_id,
+                    1,
+                    "blake3=abc",
+                    "remote-file-1"
+                )
+                .unwrap(),
+            CommitOutcome::Committed
+        );
+        assert_eq!(
+            store
+                .destination_revision(indexed.file_id, "drive")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .destination_revision(indexed.file_id, "local")
+                .unwrap(),
+            0
+        );
+
+        let history = store
+            .record_drive_history_version(DriveHistoryRecord {
+                task_id: "task",
+                file_id: indexed.file_id,
+                source_revision: 1,
+                drive_file_id: "remote-history-1",
+                account_id: "account-1",
+                relative_path_key: "report.txt",
+                display_relative_path: "Report.txt",
+                content_hash: HASH_A,
+                size_bytes: 3,
+                created_at_unix_ms: 100,
+            })
+            .unwrap();
+        let duplicate = store
+            .record_drive_history_version(DriveHistoryRecord {
+                task_id: "task",
+                file_id: indexed.file_id,
+                source_revision: 1,
+                drive_file_id: "remote-history-1",
+                account_id: "account-1",
+                relative_path_key: "report.txt",
+                display_relative_path: "Report.txt",
+                content_hash: HASH_A,
+                size_bytes: 3,
+                created_at_unix_ms: 200,
+            })
+            .unwrap();
+        assert_eq!(history, duplicate);
+        assert_eq!(
+            store
+                .list_drive_history_versions("task", indexed.file_id)
+                .unwrap(),
+            vec![history]
+        );
+
+        let next = store
+            .record_file_seen(
+                "task",
+                &run,
+                observation("report.txt", "Report.txt", 4, 2, HASH_B),
+            )
+            .unwrap();
+        let retry_job = store
+            .enqueue_drive_upload(indexed.file_id, next.source_revision)
+            .unwrap();
+        store.start_job(&retry_job).unwrap();
+        store.retry_job(&retry_job, "network unavailable").unwrap();
+        assert_eq!(
+            store
+                .destination_revision(indexed.file_id, "drive")
+                .unwrap(),
+            1
+        );
+        assert!(matches!(
+            store.bind_drive_task(&DriveTaskBinding {
+                account_id: "account-2".to_owned(),
+                ..binding
+            }),
+            Err(StorageError::DriveAccountMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn interrupted_drive_restore_is_audited_failed_on_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("state.db");
+        let restore_destination = temp.path().join("cloud-restore");
+        let restore_id;
+        {
+            let store = StateStore::open(&database).unwrap();
+            store.register_task("task", "test", true).unwrap();
+            let run = store.begin_backup_run("task").unwrap();
+            let indexed = store
+                .record_file_seen(
+                    "task",
+                    &run,
+                    observation("note.txt", "note.txt", 4, 1, HASH_A),
+                )
+                .unwrap();
+            store
+                .bind_drive_task(&DriveTaskBinding {
+                    task_id: "task".to_owned(),
+                    account_id: "account-1".to_owned(),
+                    root_folder_id: "root-1".to_owned(),
+                    task_folder_id: "task-1".to_owned(),
+                    history_folder_id: "history-1".to_owned(),
+                    folder_name: "Work".to_owned(),
+                })
+                .unwrap();
+            store
+                .record_drive_history_version(DriveHistoryRecord {
+                    task_id: "task",
+                    file_id: indexed.file_id,
+                    source_revision: 1,
+                    drive_file_id: "remote-history",
+                    account_id: "account-1",
+                    relative_path_key: "note.txt",
+                    display_relative_path: "note.txt",
+                    content_hash: HASH_A,
+                    size_bytes: 4,
+                    created_at_unix_ms: 100,
+                })
+                .unwrap();
+            restore_id = store
+                .begin_drive_restore("task", "drive:1:1", &restore_destination)
+                .unwrap()
+                .restore_id;
+        }
+        let store = StateStore::open(&database).unwrap();
+        let status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM drive_restore_audit WHERE restore_id=?1",
+                params![restore_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
     }
 
     #[test]

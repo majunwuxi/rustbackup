@@ -7,3 +7,19 @@ rust-version.workspace = true
 
 [dependencies]
 backup-core = { path = "../backup-core" }
+backup-storage = { path = "../backup-storage" }
+base64.workspace = true
+blake3.workspace = true
+httpdate.workspace = true
+md-5.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+ureq.workspace = true
+url.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "=3.6.2", default-features = false, features = ["windows-native"] }

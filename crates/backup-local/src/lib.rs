@@ -6,19 +6,23 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use backup_core::{
     validate_task_paths, BackupMode, BackupTask, FilterSet, PathValidationError, ScanError,
     Scanner, SourceUnavailablePolicy,
 };
+use backup_drive::{DriveClient, DriveError, OAuthError};
 use backup_storage::{
-    BackupRunStatus, CommitOutcome, FileObservation, HistoryRepository, IndexedFile,
-    IndexedFileState, StateStore, StorageError,
+    BackupRunStatus, CommitOutcome, DriveHistoryRecord, DriveTaskBinding, FileObservation,
+    HistoryRepository, IndexedFile, IndexedFileState, StateStore, StorageError,
 };
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tempfile::NamedTempFile;
 use thiserror::Error;
+
+mod drive_restore;
+pub use drive_restore::{restore_drive_history_version, DriveRestoreError};
 
 const SNAPSHOT_ATTEMPTS: usize = 3;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
@@ -58,6 +62,8 @@ pub enum LocalBackupError {
     UnstableSource(PathBuf),
     #[error("source snapshot checksum changed after scan: {0}")]
     SnapshotHashMismatch(PathBuf),
+    #[error("local mirror path is unsafe or unavailable for Drive upload: {0}")]
+    UnsafeMirrorFile(PathBuf),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,6 +74,8 @@ pub struct BackupSummary {
     pub copied_files: u64,
     pub source_missing_files: u64,
     pub cloud_pending_files: u64,
+    pub cloud_uploaded_files: u64,
+    pub cloud_history_versions_created: u64,
     pub history_versions_removed: u64,
     pub history_objects_removed: u64,
     pub deletion_review_required: bool,
@@ -84,6 +92,8 @@ impl BackupSummary {
             copied_files: 0,
             source_missing_files: 0,
             cloud_pending_files: 0,
+            cloud_uploaded_files: 0,
+            cloud_history_versions_created: 0,
             history_versions_removed: 0,
             history_objects_removed: 0,
             deletion_review_required: false,
@@ -150,6 +160,341 @@ pub fn backup_once(
             Err(error)
         }
     }
+}
+
+/// Runs the local backup first, then reconciles current mirror files to Drive.
+/// With no authorized Drive client the local branch still completes and the
+/// overall result remains `waiting_auth`/partial.
+pub fn backup_once_with_drive(
+    store: &mut StateStore,
+    task: &BackupTask,
+    drive: Option<&DriveClient>,
+) -> Result<BackupSummary, LocalBackupError> {
+    let mut summary = backup_once(store, task)?;
+    if task.mode != BackupMode::Dual || !task.destinations.google_drive.enabled {
+        return Ok(summary);
+    }
+
+    let Some(drive) = drive else {
+        summary.status = "waiting_auth".to_owned();
+        summary.add_issue("Google Drive authorization is required; the local backup completed");
+        finish_cloud_summary(store, &summary)?;
+        return Ok(summary);
+    };
+
+    let prior_binding = store.drive_task_binding(&task.id)?;
+    if task
+        .destinations
+        .google_drive
+        .account_id
+        .as_deref()
+        .is_some_and(|account| account != drive.account_id())
+        || prior_binding
+            .as_ref()
+            .is_some_and(|binding| binding.account_id != drive.account_id())
+    {
+        summary.add_issue("configured Google account does not match the authorized account");
+        finish_cloud_summary(store, &summary)?;
+        return Ok(summary);
+    }
+    if task.destinations.google_drive.folder_id.is_some() && prior_binding.is_none() {
+        summary.add_issue(
+            "configured Drive folder ID is not bound to this task; cloud uploads are paused",
+        );
+        finish_cloud_summary(store, &summary)?;
+        return Ok(summary);
+    }
+    if prior_binding.as_ref().is_some_and(|binding| {
+        task.destinations
+            .google_drive
+            .folder_id
+            .as_deref()
+            .is_some_and(|folder| folder != binding.task_folder_id)
+    }) {
+        summary.add_issue("configured Google Drive folder does not match the saved task binding");
+        finish_cloud_summary(store, &summary)?;
+        return Ok(summary);
+    }
+
+    if let Err(error) = drive.check_authorized() {
+        if matches!(
+            error,
+            DriveError::OAuth(OAuthError::WaitingForAuthorization)
+        ) {
+            summary.status = "waiting_auth".to_owned();
+            summary.add_issue("Google Drive authorization is required; the local backup completed");
+        } else {
+            summary.add_issue(format!("Google Drive authorization failed: {error}"));
+        }
+        finish_cloud_summary(store, &summary)?;
+        return Ok(summary);
+    }
+
+    let folders =
+        match drive.ensure_task_folders(&task.id, &task.destinations.google_drive.folder_name) {
+            Ok(folders) => folders,
+            Err(error) => {
+                summary.add_issue(format!("Google Drive folder setup failed: {error}"));
+                finish_cloud_summary(store, &summary)?;
+                return Ok(summary);
+            }
+        };
+    let binding = DriveTaskBinding {
+        task_id: task.id.clone(),
+        account_id: drive.account_id().to_owned(),
+        root_folder_id: folders.root_id,
+        task_folder_id: folders.task_id,
+        history_folder_id: folders.history_id,
+        folder_name: task.destinations.google_drive.folder_name.clone(),
+    };
+    if let Err(error) = store.bind_drive_task(&binding) {
+        summary.add_issue(format!("Google Drive binding could not be saved: {error}"));
+        finish_cloud_summary(store, &summary)?;
+        return Ok(summary);
+    }
+
+    summary.cloud_pending_files = 0;
+    for file in store.indexed_files(&task.id)? {
+        if store.destination_revision(file.file_id, "drive")? >= file.source_revision {
+            continue;
+        }
+        summary.cloud_pending_files += 1;
+        let Some(content_hash) = file.content_hash.as_deref() else {
+            summary.add_issue(format!(
+                "{}: source content hash is missing",
+                file.display_relative_path
+            ));
+            continue;
+        };
+        let Some(size_bytes) = file.size_bytes else {
+            summary.add_issue(format!(
+                "{}: source file size is missing",
+                file.display_relative_path
+            ));
+            continue;
+        };
+        if store.destination_revision(file.file_id, "local")? < file.source_revision {
+            summary.add_issue(format!(
+                "{}: verified local mirror is not current",
+                file.display_relative_path
+            ));
+            continue;
+        }
+        let mirror_path =
+            match safe_mirror_path(&task.destinations.local.path, &file.display_relative_path) {
+                Ok(path) => path,
+                Err(error) => {
+                    summary.add_issue(format!("{}: {error}", file.display_relative_path));
+                    continue;
+                }
+            };
+        let cloud_state = store.destination_state(file.file_id, "drive")?;
+        let existing_drive_file_id = cloud_state
+            .as_ref()
+            .and_then(|state| state.target_file_id.as_deref());
+        let job_id = store.enqueue_drive_upload(file.file_id, file.source_revision)?;
+        if let Err(error) = store.start_job(&job_id) {
+            summary.add_issue(format!(
+                "{}: Drive upload queue could not start: {error}",
+                file.display_relative_path
+            ));
+            continue;
+        }
+
+        let upload_result = (|| -> Result<_, DriveError> {
+            if let Some(previous) = cloud_state
+                .as_ref()
+                .filter(|state| state.committed_revision > 0)
+            {
+                let previous_drive_id = previous
+                    .target_file_id
+                    .as_deref()
+                    .ok_or(DriveError::InvalidResponse)?;
+                let archived = drive.preserve_current_revision(
+                    &task.id,
+                    file.file_id,
+                    previous.committed_revision,
+                    &file.display_relative_path,
+                    previous_drive_id,
+                    &binding.history_folder_id,
+                )?;
+                let created_at = i64::try_from(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(|_| DriveError::InvalidResponse)?
+                        .as_millis(),
+                )
+                .map_err(|_| DriveError::InvalidResponse)?;
+                store
+                    .record_drive_history_version(DriveHistoryRecord {
+                        task_id: &task.id,
+                        file_id: file.file_id,
+                        source_revision: archived.source_revision,
+                        drive_file_id: &archived.file.id,
+                        account_id: drive.account_id(),
+                        relative_path_key: &file.relative_path_key,
+                        display_relative_path: &file.display_relative_path,
+                        content_hash: &archived.content_hash,
+                        size_bytes: archived.size_bytes,
+                        created_at_unix_ms: created_at,
+                    })
+                    .map_err(|_| DriveError::InvalidResponse)?;
+                summary.cloud_history_versions_created += 1;
+            }
+            let cloud_snapshot =
+                create_stable_snapshot(&mirror_path, &task.destinations.local.path, content_hash)
+                    .map_err(|_| DriveError::LocalFileChanged)?;
+            if fs::metadata(cloud_snapshot.path())
+                .map_err(|_| DriveError::LocalFileChanged)?
+                .len()
+                != size_bytes
+            {
+                return Err(DriveError::LocalFileChanged);
+            }
+            drive.upload_file(
+                &task.id,
+                file.file_id,
+                file.source_revision,
+                &file.display_relative_path,
+                content_hash,
+                cloud_snapshot.path(),
+                &binding.task_folder_id,
+                existing_drive_file_id,
+            )
+        })();
+
+        match upload_result {
+            Ok(upload) => {
+                let verified = if upload.file.md5_checksum.is_some() {
+                    "md5"
+                } else {
+                    "size_only"
+                };
+                let checksum_info = format!(
+                    "blake3={content_hash};md5={};size={size_bytes};verified={verified}",
+                    upload.md5_checksum
+                );
+                match store.commit_drive_upload_if_current(
+                    &job_id,
+                    file.file_id,
+                    file.source_revision,
+                    &checksum_info,
+                    &upload.file.id,
+                )? {
+                    CommitOutcome::Committed => {
+                        summary.cloud_pending_files = summary.cloud_pending_files.saturating_sub(1);
+                        summary.cloud_uploaded_files += 1;
+                    }
+                    CommitOutcome::Stale => summary.add_issue(format!(
+                        "{}: a newer source revision superseded this Drive upload",
+                        file.display_relative_path
+                    )),
+                }
+            }
+            Err(error) => {
+                let error_text = drive_error_summary(&error);
+                let _ = store.retry_job(&job_id, &error_text);
+                if matches!(
+                    error,
+                    DriveError::OAuth(OAuthError::WaitingForAuthorization)
+                ) {
+                    summary.status = "waiting_auth".to_owned();
+                }
+                summary.add_issue(format!(
+                    "{}: Drive upload failed: {error_text}",
+                    file.display_relative_path
+                ));
+            }
+        }
+    }
+
+    if summary.cloud_pending_files > 0 && summary.status != "waiting_auth" {
+        summary.status = "partial_success".to_owned();
+    } else if summary.cloud_pending_files == 0
+        && summary.issues.is_empty()
+        && !summary.deletion_review_required
+        && summary.omitted_issue_count == 0
+    {
+        summary.status = "succeeded".to_owned();
+    } else if summary.status != "waiting_auth" {
+        summary.status = "partial_success".to_owned();
+    }
+    finish_cloud_summary(store, &summary)?;
+    Ok(summary)
+}
+
+fn finish_cloud_summary(
+    store: &StateStore,
+    summary: &BackupSummary,
+) -> Result<(), LocalBackupError> {
+    let status = if summary.status == "succeeded" {
+        BackupRunStatus::Succeeded
+    } else {
+        BackupRunStatus::PartialSuccess
+    };
+    store.finish_backup_run(
+        &summary.run_id,
+        status,
+        summary.scanned_files,
+        summary.copied_files,
+        summary_error_text(summary).as_deref(),
+    )?;
+    Ok(())
+}
+
+fn drive_error_summary(error: &DriveError) -> String {
+    match error {
+        DriveError::OAuth(OAuthError::WaitingForAuthorization) => {
+            "waiting for authorization".to_owned()
+        }
+        DriveError::OAuth(OAuthError::HttpStatus(status)) | DriveError::HttpStatus(status) => {
+            format!("HTTP {status}")
+        }
+        DriveError::OAuth(OAuthError::Network) | DriveError::Network => {
+            "network unavailable".to_owned()
+        }
+        DriveError::OAuth(OAuthError::SecureStoreUnavailable)
+        | DriveError::OAuth(OAuthError::SecureStoreFailure) => {
+            "secure credential storage unavailable".to_owned()
+        }
+        DriveError::RetryExhausted => "retry limit reached".to_owned(),
+        DriveError::IntegrityMismatch => "remote integrity check failed".to_owned(),
+        _ => "Drive operation failed".to_owned(),
+    }
+}
+
+fn safe_mirror_path(root: &Path, relative: &str) -> Result<PathBuf, LocalBackupError> {
+    let relative_path = Path::new(relative);
+    if relative_path.as_os_str().is_empty()
+        || relative_path.is_absolute()
+        || relative_path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(LocalBackupError::UnsafeMirrorFile(root.join(relative_path)));
+    }
+    let canonical_root = fs::canonicalize(root)
+        .map_err(|_| LocalBackupError::UnsafeMirrorFile(root.to_path_buf()))?;
+    let mut candidate = canonical_root.clone();
+    for component in relative_path.components() {
+        let Component::Normal(name) = component else {
+            return Err(LocalBackupError::UnsafeMirrorFile(root.join(relative_path)));
+        };
+        candidate.push(name);
+        let metadata = fs::symlink_metadata(&candidate)
+            .map_err(|_| LocalBackupError::UnsafeMirrorFile(candidate.clone()))?;
+        if is_reparse_point(&metadata) {
+            return Err(LocalBackupError::UnsafeMirrorFile(candidate));
+        }
+    }
+    let canonical = fs::canonicalize(&candidate)
+        .map_err(|_| LocalBackupError::UnsafeMirrorFile(candidate.clone()))?;
+    if !canonical.starts_with(&canonical_root)
+        || !fs::metadata(&canonical).is_ok_and(|metadata| metadata.is_file())
+    {
+        return Err(LocalBackupError::UnsafeMirrorFile(canonical));
+    }
+    Ok(canonical)
 }
 
 fn validate_mode(task: &BackupTask) -> Result<(), LocalBackupError> {
@@ -1165,6 +1510,27 @@ mod tests {
         fs::create_dir(&source).expect("create temporary source");
         fs::create_dir(&destination).expect("create temporary target");
         (temp, source, destination)
+    }
+
+    #[test]
+    fn dual_backup_without_drive_authorization_keeps_local_copy_and_waits_for_auth() {
+        let (_temp, source, destination) = directories();
+        fs::write(source.join("hello.txt"), b"local copy first").unwrap();
+        let mut dual_task = task(&source, &destination);
+        dual_task.mode = BackupMode::Dual;
+        dual_task.destinations.google_drive.enabled = true;
+        dual_task.destinations.google_drive.folder_name = "RustBackup/Work".to_owned();
+        let mut store = StateStore::open_in_memory().unwrap();
+
+        let summary = backup_once_with_drive(&mut store, &dual_task, None).unwrap();
+        assert_eq!(summary.status, "waiting_auth");
+        assert_eq!(summary.copied_files, 1);
+        assert_eq!(summary.cloud_pending_files, 1);
+        assert_eq!(
+            fs::read(destination.join("hello.txt")).unwrap(),
+            b"local copy first"
+        );
+        assert!(store.drive_task_binding(&dual_task.id).unwrap().is_none());
     }
 
     #[test]
