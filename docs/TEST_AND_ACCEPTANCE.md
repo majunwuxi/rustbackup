@@ -23,7 +23,8 @@ Windows 上进行真实 Drive API 冒烟验收：`cargo run -p rustbackup-deskto
 - [ ] 人工验收：验证 Google 授权访问边界；本轮只验证应用创建的测试文件位于其专用任务 folder ID 下，没有读取或修改其他 Drive 文件。
 - [ ] 人工验收：在专用测试账号中验证超过 7 天的托管历史副本会被清理，当前文件和 7 天内副本仍保留；不得使用真实备份目录做此验证。
 - [x] M4 隔离桌面/Agent 冒烟：Release 桌面端以 `--login-startup` 在独立 `%TEMP%` profile 启动；默认任务关闭且源路径为空。终止 UI 后 Agent 仍为原 PID/在线，重新启动 UI 后复用同一 Agent；测试结束已停止两个进程。
-- [ ] 人工验收：安装 NSIS 包后验证 Windows 登录触发、点关闭后窗口隐藏至托盘、托盘退出 UI 后 Agent 继续、重启后队列恢复；卸载后启动项移除且用户数据/凭据仍保留。
+- [x] 2026-10-15 NSIS 隔离安装/卸载冒烟：包安装到唯一 `%TEMP%` 目录，桌面端和 Agent 可运行；卸载后安装目录及 HKCU 卸载登记消失，测试 profile 中配置、SQLite 和日志仍保留，`RustBackupAgent` 登录启动值未被创建。
+- [ ] 人工验收：在可交互桌面验证点窗口关闭后隐藏到托盘、托盘重新打开/退出 UI，以及系统登录时启动。手动运行队列的持久化/中断恢复由 SQLite 单测覆盖。
 - [x] Agent IPC 协议单元验收：版本校验、仅状态查询命令、帧长度上限及畸形帧拒绝。
 - [x] 2026-10-15 Windows Agent IPC 冒烟：同一用户成功连续查询 3 次状态；启动第二实例后其以退出码 0 结束，原实例仍可响应。Agent 只创建 Named Pipe 和 mutex，未读取配置或访问备份路径。
 - [x] 2026-10-15 M4 隔离 Agent 运行冒烟：Release Agent 使用 `%TEMP%\RustBackup-M4-Agent-269c232e99c345fdb9e9f3743ce8f382` 下临时 APPDATA/LOCALAPPDATA 启动；默认任务保持关闭且源路径为空。状态为 `Idle`、活动任务数为 0；第二实例退出码 0，原实例仍在线；随后已停止测试进程。临时 profile 仅含测试配置、SQLite 状态与日志。

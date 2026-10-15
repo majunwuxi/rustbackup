@@ -42,11 +42,11 @@
 - [x] Agent 读取用户配置运行启用任务；SQLite v5 保存手动运行队列，Agent/worker 中断后重新排队。
 - [x] Tauri 2 UI：任务列表、添加/编辑、授权、运行/状态、暂停/恢复、历史/恢复、日志和 Agent 设置。
 - [x] 系统托盘；关闭窗口隐藏到托盘，退出 UI 不退出 Agent；当前用户 NSIS 安装包和卸载启动项清理钩子。
-**完成条件：** 代码实现、工作区检查及 Windows NSIS 构建已通过。安装/卸载后的 Windows 用户会话行为仍需按 `docs/TEST_AND_ACCEPTANCE.md` 人工验收；M3 的云端权限边界与七天后清理验收仍未完成。
+**完成条件：** 代码实现、工作区检查、Windows NSIS 构建及隔离安装/卸载测试已通过；Windows 实际登录启动和托盘点击交互仍需按 `docs/TEST_AND_ACCEPTANCE.md` 人工验收。M3 的云端权限边界与七天后清理验收仍未完成。
 
 **M4 授权切片进度：** 桌面端已有 Tauri 2 授权页，可通过系统浏览器启动 OAuth PKCE loopback 流程；首次配置初始化到 `%APPDATA%\RustBackup\config.json`，只将 Google 账号 subject 写入默认任务绑定。发行构建可通过 `RUSTBACKUP_GOOGLE_OAUTH_CLIENT_ID` 和 `RUSTBACKUP_GOOGLE_OAUTH_CLIENT_SECRET` 预置 OAuth Desktop 客户端，使普通用户只需点击连接并在 Google 页面授权；`RUSTBACKUP_GOOGLE_OAUTH_ENVIRONMENT=production` 控制正式环境标识，默认仍为测试环境。未预置客户端密钥的开发构建保留 Credential Manager 安全录入入口。客户端密钥按 Google 的公开桌面客户端模型处理，不作为用户密码或防滥用边界；refresh token 与上传会话 URI 仍由 Windows Credential Manager 保护。当前 OAuth 项目仍是测试环境，正式面向公众前需配置生产 OAuth 项目并完成适用的同意屏幕验证。连接流程不会启用任务、创建 Drive 文件夹或上传文件；账号切换和后续 Drive 实测入口尚未实现。默认源路径仍为空，任务仍关闭。
 
-**M4 交付记录（2026-10-15）：** Agent 使用用户 `%APPDATA%` 配置和 `%LOCALAPPDATA%` SQLite/日志；仅运行已启用且路径有效的任务，默认源仍为空、任务关闭。桌面端启停任务前要求确认，且只在确认后创建本地目标；手动运行请求及结果持久化在 SQLite v5 中。Agent IPC 继续限制为当前用户状态查询，报告活动 worker 数。Tauri UI 加入任务、历史、账户、日志、设置页面及目录选择；托盘关闭行为保留 Agent。登录启动写入当前用户 Run 项，NSIS 安装模式为 currentUser，卸载钩子只清除该启动项并保留用户凭据/数据。`cargo tauri build --bundles nsis` 已生成 `target/release/bundle/nsis/RustBackup_0.1.0_x64-setup.exe`；Release 桌面端/Agent 已在 `%TEMP%` 隔离配置中启动验证 UI 进程退出与重开时复用 Agent。尚未实际安装 NSIS 包；托盘交互和卸载后检查见测试清单。
+**M4 交付记录（2026-10-15）：** Agent 使用用户 `%APPDATA%` 配置和 `%LOCALAPPDATA%` SQLite/日志；仅运行已启用且路径有效的任务，默认源仍为空、任务关闭。桌面端启停任务前要求确认，且只在确认后创建本地目标；手动运行请求及结果持久化在 SQLite v5 中。Agent IPC 继续限制为当前用户状态查询，报告活动 worker 数。Tauri UI 加入任务、历史、账户、日志、设置页面及目录选择；托盘关闭行为保留 Agent。登录启动写入当前用户 Run 项，NSIS 安装模式为 currentUser，卸载钩子只清除该启动项并保留用户数据。`cargo tauri build --bundles nsis` 已生成 `target/release/bundle/nsis/RustBackup_0.1.0_x64-setup.exe`；Release 桌面端/Agent 在 `%TEMP%` 隔离配置中启动，UI 退出后 Agent 继续在线，重开 UI 复用同一 Agent。安装包也已在 `%TEMP%` 安装并运行，随后卸载；安装目录和卸载登记被清理，测试 profile 的配置、SQLite 和日志保留。实际 Windows 登录启动触发及托盘点击交互见人工验收清单。
 
 ## M5 稳定化与发布
 - [ ] 集成测试：网络中断、文件并发写入、外接磁盘消失、海量文件、长路径、权限拒绝。
