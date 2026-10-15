@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "application": {
+    "start_with_windows": true,
+    "start_minimized": true,
+    "minimize_to_tray": true,
+    "language": "zh-CN",
+    "max_parallel_transfers": 2
+  },
+  "tasks": [
+    {
+      "id": "work-documents",
+      "name": "工作资料",
+      "enabled": false,
+      "source": {
+        "path": "",
+        "recursive": true,
+        "follow_symlinks": false
+      },
+      "mode": "dual",
+      "schedule": {
+        "type": "realtime",
+        "debounce_ms": 2000,
+        "reconcile_interval_minutes": 60,
+        "scan_on_startup": true
+      },
+      "destinations": {
+        "local": {
+          "enabled": true,
+          "path": "%USERPROFILE%\\RustBackup\\Backups\\Work"
+        },
+        "google_drive": {
+          "enabled": true,
+          "account_id": null,
+          "folder_id": null,
+          "folder_name": "RustBackup/Work"
+        }
+      },
+      "versioning": {
+        "enabled": true,
+        "retention_days": 7,
+        "keep_latest": true
+      },
+      "filters": {
+        "exclude": [
+          "*.tmp",
+          "~$*",
+          ".git",
+          "node_modules"
+        ],
+        "case_insensitive": true
+      },
+      "safety": {
+        "propagate_deletions": false,
+        "preserve_deleted_files": true,
+        "verify_before_commit": true,
+        "on_source_unavailable": "pause",
+        "on_permission_denied": "retry"
+      }
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/backup-core",
+    "crates/backup-storage",
+    "crates/backup-local",
+    "crates/backup-drive",
+    "apps/agent",
+    "apps/desktop",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+rust-version = "1.78"
+
+[workspace.dependencies]
+globset = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.10"
+thiserror = "2.0"
