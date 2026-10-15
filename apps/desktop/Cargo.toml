@@ -14,3 +14,8 @@ tauri-plugin-opener.workspace = true
 
 [build-dependencies]
 tauri-build.workspace = true
+
+[dev-dependencies]
+backup-local = { path = "../../crates/backup-local" }
+backup-storage = { path = "../../crates/backup-storage" }
+serde_json.workspace = true

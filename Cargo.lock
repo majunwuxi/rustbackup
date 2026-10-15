@@ -3161,7 +3161,10 @@ version = "0.1.0"
 dependencies = [
  "backup-core",
  "backup-drive",
+ "backup-local",
+ "backup-storage",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
