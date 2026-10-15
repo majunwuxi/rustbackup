@@ -56,11 +56,12 @@ pub enum OAuthError {
     SecureStoreFailure,
     #[error("Google authorization is required")]
     WaitingForAuthorization,
-    #[error("Google {operation} failed (HTTP {status}; provider error: {code})")]
+    #[error("Google {operation} failed (HTTP {status}; provider error: {code}; {description})")]
     ProviderFailure {
         operation: &'static str,
         status: u16,
         code: String,
+        description: String,
     },
     #[error("Google request failed (HTTP {0})")]
     HttpStatus(u16),
@@ -498,7 +499,7 @@ impl OAuthClient {
         let response = match self.agent.post(endpoint).send_form(fields) {
             Ok(response) => response,
             Err(ureq::Error::Status(status, response)) => {
-                let code = provider_error_code(response).unwrap_or_else(|| "unknown".to_owned());
+                let (code, description) = provider_error(response);
                 if operation == "refresh token exchange" && status == 400 && code == "invalid_grant"
                 {
                     return Err(OAuthError::InvalidGrant);
@@ -507,6 +508,7 @@ impl OAuthClient {
                     operation,
                     status,
                     code,
+                    description,
                 });
             }
             Err(ureq::Error::Transport(_)) => return Err(OAuthError::Network),
@@ -580,32 +582,63 @@ fn refresh_expiry_key(account_id: &str) -> String {
 
 fn map_ureq_error(error: ureq::Error, operation: &'static str) -> OAuthError {
     match error {
-        ureq::Error::Status(status, response) => OAuthError::ProviderFailure {
-            operation,
-            status,
-            code: provider_error_code(response).unwrap_or_else(|| "unknown".to_owned()),
-        },
+        ureq::Error::Status(status, response) => {
+            let (code, description) = provider_error(response);
+            OAuthError::ProviderFailure {
+                operation,
+                status,
+                code,
+                description,
+            }
+        }
         ureq::Error::Transport(_) => OAuthError::Network,
     }
 }
 
-fn provider_error_code(response: ureq::Response) -> Option<String> {
+fn provider_error(response: ureq::Response) -> (String, String) {
     #[derive(Deserialize)]
     struct ErrorResponse {
         error: Option<String>,
+        error_description: Option<String>,
     }
 
-    let error: ErrorResponse = response.into_json().ok()?;
-    let code = error.error?;
-    if code.is_empty()
-        || code.len() > 64
-        || !code
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "_.-".contains(character))
-    {
-        return None;
-    }
-    Some(code)
+    let Ok(error) = response.into_json::<ErrorResponse>() else {
+        return (
+            "unknown".to_owned(),
+            "no error description supplied".to_owned(),
+        );
+    };
+    let code = error
+        .error
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 64
+                && value
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "_.-".contains(character))
+        })
+        .unwrap_or_else(|| "unknown".to_owned());
+    let description = error
+        .error_description
+        .map(|value| {
+            value
+                .chars()
+                .map(|character| {
+                    if character.is_control() {
+                        ' '
+                    } else {
+                        character
+                    }
+                })
+                .take(160)
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "no error description supplied".to_owned());
+    (code, description)
 }
 
 fn validate_google_endpoint(
@@ -774,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn authorization_errors_show_provider_code_and_failing_stage_without_details() {
+    fn authorization_errors_show_safe_provider_description_and_failing_stage() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
@@ -785,7 +818,7 @@ mod tests {
                 &mut stream,
                 400,
                 "application/json",
-                r#"{"error":"invalid_request","error_description":"private response details"}"#,
+                r#"{"error":"invalid_request","error_description":"Missing required parameter: code_verifier.\nRetry the request."}"#,
             );
         });
         let client = OAuthClient {
@@ -810,9 +843,8 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "Google authorization code exchange failed (HTTP 400; provider error: invalid_request)"
+            "Google authorization code exchange failed (HTTP 400; provider error: invalid_request; Missing required parameter: code_verifier. Retry the request.)"
         );
-        assert!(!error.to_string().contains("private response details"));
         server.join().unwrap();
     }
 
