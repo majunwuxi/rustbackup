@@ -16,6 +16,7 @@ const DRIVE_MIGRATION: &str = include_str!("../../../sql/003_drive.sql");
 const DRIVE_RETENTION_MIGRATION: &str = include_str!("../../../sql/004_drive_retention.sql");
 const TASK_QUEUE_MIGRATION: &str = include_str!("../../../sql/005_task_queue.sql");
 const SCHEMA_VERSION: i64 = 5;
+pub const DRIVE_LAYOUT_V1_MARKER: &str = "drive-layout=v1";
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 type IndexedFileRow = (i64, i64, String, Option<i64>, Option<String>);
 
@@ -805,6 +806,46 @@ impl StateStore {
             )
             .optional()?;
         Ok(row)
+    }
+
+    /// Marks the committed Drive file as having the source-directory layout.
+    /// The update is conditional on both revision and target ID so a stale
+    /// reconciliation cannot label a newer file state as complete.
+    pub fn mark_drive_layout_v1_if_current(
+        &self,
+        file_id: i64,
+        revision: i64,
+        target_drive_file_id: &str,
+    ) -> Result<bool, StorageError> {
+        if file_id <= 0 || revision <= 0 {
+            return Err(StorageError::InvalidHash);
+        }
+        validate_drive_identifier(target_drive_file_id)?;
+        let updated = self.connection.execute(
+            "UPDATE destination_states SET checksum_info=CASE \
+             WHEN COALESCE(checksum_info,'')='' THEN ?1 \
+             ELSE checksum_info || ';' || ?1 END, updated_at=datetime('now') \
+             WHERE file_id=?2 AND destination='drive' AND committed_revision=?3 \
+             AND target_file_id=?4 AND length(COALESCE(checksum_info,''))<=1008 \
+             AND instr(';' || COALESCE(checksum_info,'') || ';', ';' || ?1 || ';')=0",
+            params![
+                DRIVE_LAYOUT_V1_MARKER,
+                file_id,
+                revision,
+                target_drive_file_id
+            ],
+        )?;
+        if updated == 1 {
+            return Ok(true);
+        }
+        let state = self.destination_state(file_id, "drive")?;
+        Ok(state.is_some_and(|state| {
+            state.committed_revision == revision
+                && state.target_file_id.as_deref() == Some(target_drive_file_id)
+                && state.checksum_info.as_deref().is_some_and(|value| {
+                    value.split(';').any(|part| part == DRIVE_LAYOUT_V1_MARKER)
+                })
+        }))
     }
 
     /// Returns currently present source files. The caller must still validate
@@ -2585,6 +2626,18 @@ mod tests {
                 .unwrap(),
             0
         );
+        assert!(store
+            .mark_drive_layout_v1_if_current(indexed.file_id, 1, "remote-file-1")
+            .unwrap());
+        assert!(!store
+            .mark_drive_layout_v1_if_current(indexed.file_id, 2, "remote-file-1")
+            .unwrap());
+        assert!(store
+            .destination_checksum(indexed.file_id, "drive")
+            .unwrap()
+            .unwrap()
+            .split(';')
+            .any(|part| part == DRIVE_LAYOUT_V1_MARKER));
 
         let history = store
             .record_drive_history_version(DriveHistoryRecord {

@@ -1,9 +1,8 @@
-use std::collections::BTreeMap;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -139,6 +138,7 @@ pub struct DriveClient {
     account_id: String,
     endpoints: DriveEndpoints,
     agent: ureq::Agent,
+    folder_cache: Mutex<HashMap<String, String>>,
 }
 
 impl DriveClient {
@@ -164,6 +164,7 @@ impl DriveClient {
                 .timeout_read(Duration::from_secs(60))
                 .timeout_write(Duration::from_secs(60))
                 .build(),
+            folder_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -219,6 +220,47 @@ impl DriveClient {
         Ok(matches
             .into_iter()
             .min_by(|left, right| left.id.cmp(&right.id)))
+    }
+
+    /// Moves an already committed application-owned file to the folder chain
+    /// that matches its source-relative path, without re-uploading its bytes.
+    pub fn ensure_current_file_path(
+        &self,
+        task_id: &str,
+        source_file_id: i64,
+        relative_path: &str,
+        task_folder_id: &str,
+        drive_file_id: &str,
+    ) -> Result<DriveFile, DriveError> {
+        if !valid_identifier(task_id)
+            || source_file_id <= 0
+            || !valid_identifier(task_folder_id)
+            || !valid_identifier(drive_file_id)
+        {
+            return Err(DriveError::InvalidConfiguration);
+        }
+        let (directory_parts, file_name, normalized_path) =
+            split_relative_file_path(relative_path)?;
+        let remote = self
+            .get_file(drive_file_id)?
+            .ok_or(DriveError::InvalidResponse)?;
+        validate_current_file_identity(&remote, task_id, source_file_id)?;
+        for parent_id in &remote.parents {
+            if parent_id != task_folder_id {
+                self.validate_managed_source_parent(parent_id, task_id)?;
+            }
+        }
+        let target_parent_id =
+            self.ensure_relative_folders(task_id, &directory_parts, task_folder_id)?;
+        self.ensure_current_file_location(
+            task_id,
+            source_file_id,
+            &normalized_path,
+            &file_name,
+            task_folder_id,
+            &target_parent_id,
+            remote,
+        )
     }
 
     /// Copies the currently committed remote file into the app-managed history
@@ -419,10 +461,11 @@ impl DriveClient {
         parent_folder_id: &str,
         existing_drive_file_id: Option<&str>,
     ) -> Result<UploadResult, DriveError> {
+        let (directory_parts, file_name, normalized_path) =
+            split_relative_file_path(relative_path)?;
         if !valid_identifier(task_id)
             || source_file_id <= 0
             || source_revision <= 0
-            || !valid_drive_name(relative_path)
             || source_hash.len() != 64
             || !source_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
             || !valid_identifier(parent_folder_id)
@@ -446,6 +489,8 @@ impl DriveClient {
                 .find_current_file(task_id, source_file_id)?
                 .map(|file| file.id);
         }
+        let target_parent_id =
+            self.ensure_relative_folders(task_id, &directory_parts, parent_folder_id)?;
         let session_key =
             upload_session_key(&self.account_id, task_id, source_file_id, source_revision);
 
@@ -453,14 +498,31 @@ impl DriveClient {
         // Reconcile the revision marker before creating another upload session.
         if let Some(remote_id) = file_id.as_deref() {
             if let Some(remote) = self.get_file(remote_id)? {
+                let remote = self.ensure_current_file_location(
+                    task_id,
+                    source_file_id,
+                    &normalized_path,
+                    &file_name,
+                    parent_folder_id,
+                    &target_parent_id,
+                    remote,
+                )?;
                 if is_same_revision(&remote, source_revision, source_hash, size) {
                     self.credentials.remove(&session_key)?;
-                    return Ok(UploadResult {
-                        file: remote,
-                        md5_checksum,
-                        size_bytes: size,
-                        reconciled: true,
-                    });
+                    return self.finish_upload(
+                        task_id,
+                        source_file_id,
+                        &normalized_path,
+                        &file_name,
+                        parent_folder_id,
+                        &target_parent_id,
+                        UploadResult {
+                            file: remote,
+                            md5_checksum,
+                            size_bytes: size,
+                            reconciled: true,
+                        },
+                    );
                 }
             }
         } else if let Some(remote) =
@@ -468,12 +530,20 @@ impl DriveClient {
         {
             if is_same_revision(&remote, source_revision, source_hash, size) {
                 self.credentials.remove(&session_key)?;
-                return Ok(UploadResult {
-                    file: remote,
-                    md5_checksum,
-                    size_bytes: size,
-                    reconciled: true,
-                });
+                return self.finish_upload(
+                    task_id,
+                    source_file_id,
+                    &normalized_path,
+                    &file_name,
+                    parent_folder_id,
+                    &target_parent_id,
+                    UploadResult {
+                        file: remote,
+                        md5_checksum,
+                        size_bytes: size,
+                        reconciled: true,
+                    },
+                );
             }
         }
 
@@ -483,12 +553,13 @@ impl DriveClient {
         properties.insert("rb_revision".to_owned(), source_revision.to_string());
         properties.insert("rb_hash".to_owned(), source_hash.to_ascii_lowercase());
         properties.insert("rb_role".to_owned(), "current".to_owned());
+        properties.insert("rb_path".to_owned(), truncate_property(&normalized_path));
         let mut body = serde_json::json!({
-            "name": truncate_drive_name(relative_path),
+            "name": truncate_drive_name(&file_name),
             "appProperties": properties,
         });
         if file_id.is_none() {
-            body["parents"] = serde_json::json!([parent_folder_id]);
+            body["parents"] = serde_json::json!([target_parent_id]);
         }
 
         let mut session_uri = self.credentials.get(&session_key)?;
@@ -498,12 +569,20 @@ impl DriveClient {
                 Ok(SessionStatus::Complete(file)) => {
                     self.credentials.remove(&session_key)?;
                     verify_remote_file(&file, size, &md5_checksum)?;
-                    return Ok(UploadResult {
-                        file,
-                        md5_checksum,
-                        size_bytes: size,
-                        reconciled: true,
-                    });
+                    return self.finish_upload(
+                        task_id,
+                        source_file_id,
+                        &normalized_path,
+                        &file_name,
+                        parent_folder_id,
+                        &target_parent_id,
+                        UploadResult {
+                            file,
+                            md5_checksum,
+                            size_bytes: size,
+                            reconciled: true,
+                        },
+                    );
                 }
                 Ok(SessionStatus::Incomplete(next_offset)) => offset = next_offset,
                 Err(DriveError::SessionExpired) => {
@@ -526,12 +605,20 @@ impl DriveClient {
                 let file = response.json::<DriveFile>()?;
                 self.credentials.remove(&session_key)?;
                 verify_remote_file(&file, 0, &md5_checksum)?;
-                return Ok(UploadResult {
-                    file,
-                    md5_checksum,
-                    size_bytes: 0,
-                    reconciled: false,
-                });
+                return self.finish_upload(
+                    task_id,
+                    source_file_id,
+                    &normalized_path,
+                    &file_name,
+                    parent_folder_id,
+                    &target_parent_id,
+                    UploadResult {
+                        file,
+                        md5_checksum,
+                        size_bytes: 0,
+                        reconciled: false,
+                    },
+                );
             }
             return Err(DriveError::InvalidResponse);
         }
@@ -563,12 +650,22 @@ impl DriveClient {
                         &md5_checksum,
                     )? {
                         SessionStatus::Complete(file) => {
-                            return Ok(UploadResult {
-                                file,
-                                md5_checksum,
-                                size_bytes: size,
-                                reconciled: true,
-                            });
+                            verify_remote_file(&file, size, &md5_checksum)?;
+                            self.credentials.remove(&session_key)?;
+                            return self.finish_upload(
+                                task_id,
+                                source_file_id,
+                                &normalized_path,
+                                &file_name,
+                                parent_folder_id,
+                                &target_parent_id,
+                                UploadResult {
+                                    file,
+                                    md5_checksum,
+                                    size_bytes: size,
+                                    reconciled: true,
+                                },
+                            );
                         }
                         SessionStatus::Incomplete(next_offset) => {
                             if next_offset > size {
@@ -608,12 +705,20 @@ impl DriveClient {
                 let file = response.json::<DriveFile>()?;
                 self.credentials.remove(&session_key)?;
                 verify_remote_file(&file, size, &md5_checksum)?;
-                return Ok(UploadResult {
-                    file,
-                    md5_checksum,
-                    size_bytes: size,
-                    reconciled: false,
-                });
+                return self.finish_upload(
+                    task_id,
+                    source_file_id,
+                    &normalized_path,
+                    &file_name,
+                    parent_folder_id,
+                    &target_parent_id,
+                    UploadResult {
+                        file,
+                        md5_checksum,
+                        size_bytes: size,
+                        reconciled: false,
+                    },
+                );
             }
             if response.status == 404 || response.status == 410 {
                 self.credentials.remove(&session_key)?;
@@ -720,6 +825,177 @@ impl DriveClient {
         Ok(())
     }
 
+    fn ensure_relative_folders(
+        &self,
+        task_id: &str,
+        directory_parts: &[String],
+        root_folder_id: &str,
+    ) -> Result<String, DriveError> {
+        if !valid_identifier(task_id) || !valid_identifier(root_folder_id) {
+            return Err(DriveError::InvalidConfiguration);
+        }
+        let mut cache = self
+            .folder_cache
+            .lock()
+            .map_err(|_| DriveError::InvalidResponse)?;
+        let mut parent_id = root_folder_id.to_owned();
+        let mut relative_path = String::new();
+        for part in directory_parts {
+            if !valid_drive_name(part) || part.contains(['/', '\\']) {
+                return Err(DriveError::InvalidConfiguration);
+            }
+            if !relative_path.is_empty() {
+                relative_path.push('/');
+            }
+            relative_path.push_str(part);
+            let path_hash = blake3::hash(relative_path.as_bytes()).to_hex().to_string();
+            let cache_key = format!("{task_id}:{parent_id}:{path_hash}");
+            if let Some(folder_id) = cache.get(&cache_key) {
+                parent_id.clone_from(folder_id);
+                continue;
+            }
+            let role = format!("source-dir:{path_hash}");
+            let folder = self.ensure_folder(task_id, &role, part, Some(&parent_id))?;
+            parent_id.clone_from(&folder.id);
+            cache.insert(cache_key, folder.id);
+        }
+        Ok(parent_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_upload(
+        &self,
+        task_id: &str,
+        source_file_id: i64,
+        normalized_path: &str,
+        file_name: &str,
+        task_folder_id: &str,
+        parent_folder_id: &str,
+        mut result: UploadResult,
+    ) -> Result<UploadResult, DriveError> {
+        result.file = self.ensure_current_file_location(
+            task_id,
+            source_file_id,
+            normalized_path,
+            file_name,
+            task_folder_id,
+            parent_folder_id,
+            result.file,
+        )?;
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_current_file_location(
+        &self,
+        task_id: &str,
+        source_file_id: i64,
+        normalized_path: &str,
+        file_name: &str,
+        task_folder_id: &str,
+        target_parent_id: &str,
+        remote: DriveFile,
+    ) -> Result<DriveFile, DriveError> {
+        let path_marker = truncate_property(normalized_path);
+        validate_current_file_identity(&remote, task_id, source_file_id)?;
+        let parents_to_remove = remote
+            .parents
+            .iter()
+            .filter(|parent| parent.as_str() != target_parent_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        for parent_id in &parents_to_remove {
+            if parent_id == task_folder_id {
+                continue;
+            }
+            self.validate_managed_source_parent(parent_id, task_id)?;
+        }
+        let path_matches = remote.app_properties.get("rb_path") == Some(&path_marker);
+        if remote.name == truncate_drive_name(file_name)
+            && remote
+                .parents
+                .iter()
+                .any(|parent| parent == target_parent_id)
+            && parents_to_remove.is_empty()
+            && path_matches
+        {
+            return Ok(remote);
+        }
+
+        let mut url = Url::parse(&format!(
+            "{}/files/{}",
+            self.api_root(),
+            encode_path_segment(&remote.id)
+        ))
+        .map_err(|_| DriveError::InvalidConfiguration)?;
+        url.query_pairs_mut().append_pair(
+            "fields",
+            "id,name,mimeType,size,md5Checksum,appProperties,parents",
+        );
+        if !remote
+            .parents
+            .iter()
+            .any(|parent| parent == target_parent_id)
+        {
+            url.query_pairs_mut()
+                .append_pair("addParents", target_parent_id);
+        }
+        if !parents_to_remove.is_empty() {
+            url.query_pairs_mut()
+                .append_pair("removeParents", &parents_to_remove.join(","));
+        }
+        let mut properties = remote.app_properties.clone();
+        properties.insert("rb_path".to_owned(), path_marker);
+        let body = serde_json::json!({
+            "name": truncate_drive_name(file_name),
+            "appProperties": properties,
+        });
+        let updated: DriveFile = self.api_json("PATCH", url.as_str(), Some(&body))?;
+        validate_remote_file(&updated)?;
+        if updated.id != remote.id
+            || updated.mime_type == FOLDER_MIME_TYPE
+            || updated.name != truncate_drive_name(file_name)
+            || !updated
+                .parents
+                .iter()
+                .any(|parent| parent == target_parent_id)
+            || updated
+                .parents
+                .iter()
+                .any(|parent| parent != target_parent_id)
+            || updated.app_properties.get("rb_task").map(String::as_str) != Some(task_id)
+            || updated.app_properties.get("rb_file").map(String::as_str)
+                != Some(source_file_id.to_string().as_str())
+            || updated.app_properties.get("rb_role").map(String::as_str) != Some("current")
+            || updated.app_properties.get("rb_path") != Some(&truncate_property(normalized_path))
+        {
+            return Err(DriveError::InvalidResponse);
+        }
+        Ok(updated)
+    }
+
+    fn validate_managed_source_parent(
+        &self,
+        parent_id: &str,
+        task_id: &str,
+    ) -> Result<(), DriveError> {
+        let parent = self
+            .get_file(parent_id)?
+            .ok_or(DriveError::InvalidResponse)?;
+        let role = parent
+            .app_properties
+            .get("rb_role")
+            .map(String::as_str)
+            .unwrap_or_default();
+        if parent.mime_type != FOLDER_MIME_TYPE
+            || parent.app_properties.get("rb_task").map(String::as_str) != Some(task_id)
+            || !role.starts_with("folder:source-dir:")
+        {
+            return Err(DriveError::InvalidResponse);
+        }
+        Ok(())
+    }
+
     fn ensure_folder(
         &self,
         task_id: &str,
@@ -784,7 +1060,13 @@ impl DriveClient {
         );
         let folder: DriveFile = self.api_json("POST", &url, Some(&body))?;
         validate_remote_file(&folder)?;
-        if folder.mime_type != FOLDER_MIME_TYPE {
+        let expected_role = format!("folder:{role}");
+        if folder.mime_type != FOLDER_MIME_TYPE
+            || folder.app_properties.get("rb_task").map(String::as_str) != Some(task_id)
+            || folder.app_properties.get("rb_role").map(String::as_str)
+                != Some(expected_role.as_str())
+            || parent_id.is_some_and(|parent| !folder.parents.iter().any(|value| value == parent))
+        {
             return Err(DriveError::InvalidResponse);
         }
         Ok(folder)
@@ -1278,6 +1560,24 @@ fn validate_remote_file(file: &DriveFile) -> Result<(), DriveError> {
     Ok(())
 }
 
+fn validate_current_file_identity(
+    file: &DriveFile,
+    task_id: &str,
+    source_file_id: i64,
+) -> Result<(), DriveError> {
+    let source_file_marker = source_file_id.to_string();
+    if !valid_identifier(&file.id)
+        || file.mime_type == FOLDER_MIME_TYPE
+        || file.app_properties.get("rb_task").map(String::as_str) != Some(task_id)
+        || file.app_properties.get("rb_file").map(String::as_str)
+            != Some(source_file_marker.as_str())
+        || file.app_properties.get("rb_role").map(String::as_str) != Some("current")
+    {
+        return Err(DriveError::InvalidResponse);
+    }
+    Ok(())
+}
+
 fn status_error(response: &ApiResponse) -> DriveError {
     if response.status == 0 {
         DriveError::Network
@@ -1361,6 +1661,38 @@ fn valid_identifier(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn split_relative_file_path(value: &str) -> Result<(Vec<String>, String, String), DriveError> {
+    if value.is_empty()
+        || value.len() > 4096
+        || value.starts_with('/')
+        || value.starts_with('\\')
+        || value.chars().any(char::is_control)
+    {
+        return Err(DriveError::InvalidConfiguration);
+    }
+    let parts = value.split(['/', '\\']).collect::<Vec<_>>();
+    if parts.iter().any(|part| {
+        part.is_empty()
+            || *part == "."
+            || *part == ".."
+            || part.contains(':')
+            || !valid_drive_name(part)
+    }) {
+        return Err(DriveError::InvalidConfiguration);
+    }
+    let file_name = parts
+        .last()
+        .copied()
+        .ok_or(DriveError::InvalidConfiguration)?
+        .to_owned();
+    let directories = parts[..parts.len() - 1]
+        .iter()
+        .map(|part| (*part).to_owned())
+        .collect();
+    let normalized_path = parts.join("/");
+    Ok((directories, file_name, normalized_path))
 }
 
 fn valid_drive_name(value: &str) -> bool {
@@ -1791,7 +2123,7 @@ mod tests {
         let expected_md5 = md5.clone();
         let expected_hash = hash.clone();
         let expected_contents = contents.clone();
-        let (endpoints, server) = mock_server(5, move |index, request| match index {
+        let (endpoints, server) = mock_server(9, move |index, request| match index {
             0 => {
                 assert_eq!(request.method, "GET");
                 MockResponse::json(
@@ -1799,15 +2131,55 @@ mod tests {
                     serde_json::json!({"error": {"errors": [{"reason": "rateLimitExceeded"}]}}),
                 )
             }
-            1 | 2 => {
+            1 | 2 | 4 | 6 => {
                 assert_eq!(request.method, "GET");
                 MockResponse::json(200, serde_json::json!({"files": []}))
             }
-            3 => {
+            3 | 5 => {
+                assert_eq!(request.method, "POST");
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["mimeType"], FOLDER_MIME_TYPE);
+                assert!(body["appProperties"]["rb_role"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("folder:source-dir:"));
+                if index == 3 {
+                    assert_eq!(body["name"], "Dept");
+                    assert_eq!(body["parents"][0], "task-folder");
+                    MockResponse::json(
+                        200,
+                        serde_json::json!({
+                            "id": "source-dir-1",
+                            "name": "Dept",
+                            "mimeType": FOLDER_MIME_TYPE,
+                            "appProperties": body["appProperties"],
+                            "parents": ["task-folder"]
+                        }),
+                    )
+                } else {
+                    assert_eq!(body["name"], "2026");
+                    assert_eq!(body["parents"][0], "source-dir-1");
+                    MockResponse::json(
+                        200,
+                        serde_json::json!({
+                            "id": "source-dir-2",
+                            "name": "2026",
+                            "mimeType": FOLDER_MIME_TYPE,
+                            "appProperties": body["appProperties"],
+                            "parents": ["source-dir-1"]
+                        }),
+                    )
+                }
+            }
+            7 => {
                 assert_eq!(request.method, "POST");
                 assert!(request
                     .target
                     .starts_with("/upload/drive/v3/files?uploadType=resumable"));
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["name"], "source.txt");
+                assert_eq!(body["parents"][0], "source-dir-2");
+                assert_eq!(body["appProperties"]["rb_path"], "Dept/2026/source.txt");
                 assert!(String::from_utf8_lossy(&request.body).contains("rb_revision"));
                 MockResponse::json(200, serde_json::json!({})).header(
                     "Location",
@@ -1820,13 +2192,22 @@ mod tests {
                 assert_eq!(request.body, expected_contents);
                 MockResponse::json(
                     200,
-                    file_json(
-                        "remote-new",
-                        &expected_hash,
-                        &expected_md5,
-                        expected_contents.len() as u64,
-                        1,
-                    ),
+                    serde_json::json!({
+                        "id": "remote-new",
+                        "name": "source.txt",
+                        "mimeType": "application/octet-stream",
+                        "size": expected_contents.len().to_string(),
+                        "md5Checksum": expected_md5,
+                        "parents": ["source-dir-2"],
+                        "appProperties": {
+                            "rb_task": "work-documents",
+                            "rb_file": "11",
+                            "rb_revision": "1",
+                            "rb_hash": expected_hash,
+                            "rb_role": "current",
+                            "rb_path": "Dept/2026/source.txt"
+                        }
+                    }),
                 )
             }
         });
@@ -1840,7 +2221,7 @@ mod tests {
                 "work-documents",
                 11,
                 1,
-                "folder/source.txt",
+                "Dept/2026/source.txt",
                 &hash,
                 &path,
                 "task-folder",
@@ -1856,6 +2237,316 @@ mod tests {
     }
 
     #[test]
+    fn source_relative_directories_are_created_and_file_uses_leaf_name() {
+        let contents = b"nested cloud file".to_vec();
+        let md5 = format!("{:x}", Md5::digest(&contents));
+        let hash = blake3::hash(&contents).to_hex().to_string();
+        let expected_contents = contents.clone();
+        let expected_md5 = md5.clone();
+        let expected_hash = hash.clone();
+        let (endpoints, server) = mock_server(8, move |index, request| match index {
+            0 | 1 | 3 | 5 => {
+                assert_eq!(request.method, "GET");
+                MockResponse::json(200, serde_json::json!({"files": []}))
+            }
+            2 | 4 => {
+                assert_eq!(request.method, "POST");
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["mimeType"], FOLDER_MIME_TYPE);
+                assert!(body["appProperties"]["rb_role"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("folder:source-dir:"));
+                if index == 2 {
+                    assert_eq!(body["name"], "Dept");
+                    assert_eq!(body["parents"][0], "task-folder");
+                    MockResponse::json(
+                        200,
+                        serde_json::json!({
+                            "id": "source-dir-1",
+                            "name": "Dept",
+                            "mimeType": FOLDER_MIME_TYPE,
+                            "appProperties": body["appProperties"],
+                            "parents": ["task-folder"]
+                        }),
+                    )
+                } else {
+                    assert_eq!(body["name"], "2026");
+                    assert_eq!(body["parents"][0], "source-dir-1");
+                    MockResponse::json(
+                        200,
+                        serde_json::json!({
+                            "id": "source-dir-2",
+                            "name": "2026",
+                            "mimeType": FOLDER_MIME_TYPE,
+                            "appProperties": body["appProperties"],
+                            "parents": ["source-dir-1"]
+                        }),
+                    )
+                }
+            }
+            6 => {
+                assert_eq!(request.method, "POST");
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["name"], "report.txt");
+                assert_eq!(body["parents"][0], "source-dir-2");
+                assert_eq!(body["appProperties"]["rb_path"], "Dept/2026/report.txt");
+                MockResponse::json(200, serde_json::json!({})).header(
+                    "Location",
+                    &format!("http://{}/session/nested", request.headers["host"]),
+                )
+            }
+            _ => {
+                assert_eq!(request.method, "PUT");
+                assert_eq!(request.target, "/session/nested");
+                assert_eq!(request.body, expected_contents);
+                MockResponse::json(
+                    200,
+                    serde_json::json!({
+                        "id": "nested-file",
+                        "name": "report.txt",
+                        "mimeType": "application/octet-stream",
+                        "size": expected_contents.len().to_string(),
+                        "md5Checksum": expected_md5,
+                        "parents": ["source-dir-2"],
+                        "appProperties": {
+                            "rb_task": "work-documents",
+                            "rb_file": "11",
+                            "rb_revision": "1",
+                            "rb_hash": expected_hash,
+                            "rb_role": "current",
+                            "rb_path": "Dept/2026/report.txt"
+                        }
+                    }),
+                )
+            }
+        });
+        let client = test_client(endpoints, Arc::new(MemoryCredentials::default()));
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("report.txt");
+        fs::write(&path, &contents).unwrap();
+        let result = client
+            .upload_file(
+                "work-documents",
+                11,
+                1,
+                "Dept/2026/report.txt",
+                &hash,
+                &path,
+                "task-folder",
+                None,
+            )
+            .unwrap();
+        assert_eq!(result.file.name, "report.txt");
+        assert_eq!(result.file.parents, ["source-dir-2"]);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn flattened_current_file_is_moved_into_its_source_directory() {
+        let contents = b"unchanged file".to_vec();
+        let hash = blake3::hash(&contents).to_hex().to_string();
+        let expected_hash = hash.clone();
+        let size_bytes = contents.len() as u64;
+        let md5_checksum = format!("{:x}", Md5::digest(&contents));
+        let expected_md5 = md5_checksum.clone();
+        let remote_file = serde_json::json!({
+            "id": "legacy-flat",
+            "name": "Dept\\report.txt",
+            "mimeType": "application/octet-stream",
+            "size": size_bytes.to_string(),
+            "md5Checksum": md5_checksum,
+            "parents": ["task-folder"],
+            "appProperties": {
+                "rb_task": "work-documents",
+                "rb_file": "11",
+                "rb_revision": "3",
+                "rb_hash": hash,
+                "rb_role": "current",
+                "rb_path": "Dept/report.txt"
+            }
+        });
+        let path_marker = "Dept/report.txt".to_owned();
+        let (endpoints, server) = mock_server(4, move |index, request| match index {
+            0 => {
+                assert_eq!(request.method, "GET");
+                assert!(request.target.starts_with("/drive/v3/files/legacy-flat?"));
+                MockResponse::json(200, remote_file.clone())
+            }
+            1 => {
+                assert_eq!(request.method, "GET");
+                MockResponse::json(200, serde_json::json!({"files": []}))
+            }
+            2 => {
+                assert_eq!(request.method, "POST");
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["name"], "Dept");
+                MockResponse::json(
+                    200,
+                    serde_json::json!({
+                        "id": "nested-folder",
+                        "name": "Dept",
+                        "mimeType": FOLDER_MIME_TYPE,
+                        "appProperties": body["appProperties"],
+                        "parents": ["task-folder"]
+                    }),
+                )
+            }
+            _ => {
+                assert_eq!(request.method, "PATCH");
+                assert!(request.target.contains("addParents=nested-folder"));
+                assert!(request.target.contains("removeParents=task-folder"));
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["name"], "report.txt");
+                assert_eq!(body["appProperties"]["rb_path"], path_marker);
+                MockResponse::json(
+                    200,
+                    serde_json::json!({
+                        "id": "legacy-flat",
+                        "name": "report.txt",
+                        "mimeType": "application/octet-stream",
+                        "size": size_bytes.to_string(),
+                        "md5Checksum": expected_md5,
+                        "parents": ["nested-folder"],
+                        "appProperties": {
+                            "rb_task": "work-documents",
+                            "rb_file": "11",
+                            "rb_revision": "3",
+                            "rb_hash": expected_hash,
+                            "rb_role": "current",
+                            "rb_path": "Dept/report.txt"
+                        }
+                    }),
+                )
+            }
+        });
+        let client = test_client(endpoints, Arc::new(MemoryCredentials::default()));
+        let moved = client
+            .ensure_current_file_path(
+                "work-documents",
+                11,
+                "Dept/report.txt",
+                "task-folder",
+                "legacy-flat",
+            )
+            .unwrap();
+        assert_eq!(moved.name, "report.txt");
+        assert_eq!(moved.parents, ["nested-folder"]);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn refuses_to_move_current_file_out_of_an_unmanaged_parent() {
+        let (endpoints, server) = mock_server(2, |index, request| match index {
+            0 => {
+                assert_eq!(request.method, "GET");
+                MockResponse::json(
+                    200,
+                    serde_json::json!({
+                        "id": "managed-current",
+                        "name": "report.txt",
+                        "mimeType": "application/octet-stream",
+                        "parents": ["foreign-folder"],
+                        "appProperties": {
+                            "rb_task": "work-documents",
+                            "rb_file": "11",
+                            "rb_role": "current"
+                        }
+                    }),
+                )
+            }
+            _ => {
+                assert_eq!(request.method, "GET");
+                assert!(request
+                    .target
+                    .starts_with("/drive/v3/files/foreign-folder?"));
+                MockResponse::json(
+                    200,
+                    serde_json::json!({
+                        "id": "foreign-folder",
+                        "name": "User folder",
+                        "mimeType": FOLDER_MIME_TYPE,
+                        "appProperties": {
+                            "rb_task": "another-task",
+                            "rb_role": "folder:source-dir:foreign"
+                        }
+                    }),
+                )
+            }
+        });
+        let client = test_client(endpoints, Arc::new(MemoryCredentials::default()));
+        assert!(matches!(
+            client.ensure_current_file_path(
+                "work-documents",
+                11,
+                "Dept/report.txt",
+                "task-folder",
+                "managed-current"
+            ),
+            Err(DriveError::InvalidResponse)
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn relative_path_validation_blocks_rooted_and_traversal_paths() {
+        let (directories, file_name, normalized) =
+            split_relative_file_path("Dept\\2026/report.txt").unwrap();
+        assert_eq!(directories, ["Dept", "2026"]);
+        assert_eq!(file_name, "report.txt");
+        assert_eq!(normalized, "Dept/2026/report.txt");
+
+        for invalid in [
+            "",
+            "/report.txt",
+            "\\report.txt",
+            "C:\\report.txt",
+            "Dept/../report.txt",
+            "Dept//report.txt",
+        ] {
+            assert!(matches!(
+                split_relative_file_path(invalid),
+                Err(DriveError::InvalidConfiguration)
+            ));
+        }
+    }
+
+    #[test]
+    fn nested_folder_ids_are_cached_and_reused_within_a_backup_run() {
+        let (endpoints, server) = mock_server(2, |index, request| match index {
+            0 => {
+                assert_eq!(request.method, "GET");
+                MockResponse::json(200, serde_json::json!({"files": []}))
+            }
+            _ => {
+                assert_eq!(request.method, "POST");
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                MockResponse::json(
+                    200,
+                    serde_json::json!({
+                        "id": "cached-folder",
+                        "name": body["name"],
+                        "mimeType": FOLDER_MIME_TYPE,
+                        "appProperties": body["appProperties"],
+                        "parents": ["task-folder"]
+                    }),
+                )
+            }
+        });
+        let client = test_client(endpoints, Arc::new(MemoryCredentials::default()));
+        let directory_parts = vec!["Dept".to_owned()];
+        let first = client
+            .ensure_relative_folders("work-documents", &directory_parts, "task-folder")
+            .unwrap();
+        let second = client
+            .ensure_relative_folders("work-documents", &directory_parts, "task-folder")
+            .unwrap();
+        assert_eq!(first, "cached-folder");
+        assert_eq!(second, first);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn update_resumes_session_and_reconciles_uncertain_completion() {
         let contents = b"hello drive".to_vec();
         let md5 = format!("{:x}", Md5::digest(&contents));
@@ -1866,7 +2557,21 @@ mod tests {
         let (endpoints, server) = mock_server(3, move |index, request| match index {
             0 => MockResponse::json(
                 200,
-                serde_json::json!({"id":"remote-current","name":"doc.txt","size":"3","md5Checksum":"old","appProperties":{"rb_revision":"1","rb_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}),
+                serde_json::json!({
+                    "id":"remote-current",
+                    "name":"doc.txt",
+                    "size":"3",
+                    "md5Checksum":"old",
+                    "parents":["task-folder"],
+                    "appProperties":{
+                        "rb_task":"work-documents",
+                        "rb_file":"11",
+                        "rb_revision":"1",
+                        "rb_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "rb_role":"current",
+                        "rb_path":"doc.txt"
+                    }
+                }),
             ),
             1 => {
                 assert_eq!(request.method, "PUT");
@@ -1925,7 +2630,21 @@ mod tests {
         let (endpoints, server) = mock_server(1, move |_index, _request| {
             MockResponse::json(
                 200,
-                serde_json::json!({"id":"remote-current","name":"doc.txt","size":"11","md5Checksum":reconciled_md5,"appProperties":{"rb_revision":"2","rb_hash":reconciled_hash}}),
+                serde_json::json!({
+                    "id":"remote-current",
+                    "name":"doc.txt",
+                    "size":"11",
+                    "md5Checksum":reconciled_md5,
+                    "parents":["task-folder"],
+                    "appProperties":{
+                        "rb_task":"work-documents",
+                        "rb_file":"11",
+                        "rb_revision":"2",
+                        "rb_hash":reconciled_hash,
+                        "rb_role":"current",
+                        "rb_path":"doc.txt"
+                    }
+                }),
             )
         });
         let client = test_client(endpoints, Arc::new(MemoryCredentials::default()));
@@ -1956,7 +2675,20 @@ mod tests {
         let (endpoints, server) = mock_server(4, move |index, request| match index {
             0 => MockResponse::json(
                 200,
-                serde_json::json!({"id":"remote-current","name":"doc.txt","size":"3","appProperties":{"rb_revision":"1","rb_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}),
+                serde_json::json!({
+                    "id":"remote-current",
+                    "name":"doc.txt",
+                    "size":"3",
+                    "parents":["task-folder"],
+                    "appProperties":{
+                        "rb_task":"work-documents",
+                        "rb_file":"11",
+                        "rb_revision":"1",
+                        "rb_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "rb_role":"current",
+                        "rb_path":"doc.txt"
+                    }
+                }),
             ),
             1 => {
                 assert_eq!(request.method, "PUT");
@@ -2063,7 +2795,20 @@ mod tests {
         let (endpoints, server) = mock_server(4, move |index, request| match index {
             0 => MockResponse::json(
                 200,
-                serde_json::json!({"id":"remote-current","name":"doc.txt","size":"3","appProperties":{"rb_revision":"1","rb_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}),
+                serde_json::json!({
+                    "id":"remote-current",
+                    "name":"doc.txt",
+                    "size":"3",
+                    "parents":["task-folder"],
+                    "appProperties":{
+                        "rb_task":"work-documents",
+                        "rb_file":"11",
+                        "rb_revision":"1",
+                        "rb_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "rb_role":"current",
+                        "rb_path":"doc.txt"
+                    }
+                }),
             ),
             1 => MockResponse::raw(308, Vec::new()).header("Range", "bytes=0-1"),
             2 => {
@@ -2151,11 +2896,19 @@ mod tests {
     fn file_json(id: &str, hash: &str, md5: &str, size: u64, revision: i64) -> serde_json::Value {
         serde_json::json!({
             "id": id,
-            "name": "file.txt",
+            "name": "doc.txt",
             "mimeType": "application/octet-stream",
             "size": size.to_string(),
             "md5Checksum": md5,
-            "appProperties": {"rb_revision": revision.to_string(), "rb_hash": hash},
+            "parents": ["task-folder"],
+            "appProperties": {
+                "rb_task": "work-documents",
+                "rb_file": "11",
+                "rb_revision": revision.to_string(),
+                "rb_hash": hash,
+                "rb_role": "current",
+                "rb_path": "doc.txt"
+            },
         })
     }
 

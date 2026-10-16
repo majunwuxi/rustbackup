@@ -16,6 +16,7 @@ use backup_drive::{DriveClient, DriveError, OAuthError};
 use backup_storage::{
     BackupRunStatus, CommitOutcome, DriveHistoryRecord, DriveHistoryVersion, DriveTaskBinding,
     FileObservation, HistoryRepository, IndexedFile, IndexedFileState, StateStore, StorageError,
+    DRIVE_LAYOUT_V1_MARKER,
 };
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tempfile::NamedTempFile;
@@ -279,7 +280,55 @@ pub fn backup_once_with_drive(
 
     summary.cloud_pending_files = 0;
     for file in store.indexed_files(&task.id)? {
-        if store.destination_revision(file.file_id, "drive")? >= file.source_revision {
+        let cloud_state = store.destination_state(file.file_id, "drive")?;
+        if cloud_state
+            .as_ref()
+            .map_or(0, |state| state.committed_revision)
+            >= file.source_revision
+        {
+            if let Some(state) = cloud_state
+                .as_ref()
+                .filter(|state| state.committed_revision == file.source_revision)
+            {
+                let layout_current = state.target_file_id.is_some()
+                    && state.checksum_info.as_deref().is_some_and(|info| {
+                        info.split(';').any(|part| part == DRIVE_LAYOUT_V1_MARKER)
+                    });
+                if !layout_current {
+                    if let Some(drive_file_id) = state.target_file_id.as_deref() {
+                        match drive.ensure_current_file_path(
+                            &task.id,
+                            file.file_id,
+                            &file.display_relative_path,
+                            &binding.task_folder_id,
+                            drive_file_id,
+                        ) {
+                            Ok(_) => {
+                                if !store.mark_drive_layout_v1_if_current(
+                                    file.file_id,
+                                    state.committed_revision,
+                                    drive_file_id,
+                                )? {
+                                    summary.add_issue(format!(
+                                        "{}: Drive state changed while folder layout was being reconciled",
+                                        file.display_relative_path
+                                    ));
+                                }
+                            }
+                            Err(error) => summary.add_issue(format!(
+                                "{}: Google Drive folder layout could not be reconciled: {}",
+                                file.display_relative_path,
+                                drive_error_summary(&error)
+                            )),
+                        }
+                    } else {
+                        summary.add_issue(format!(
+                            "{}: committed Drive state has no file ID for folder reconciliation",
+                            file.display_relative_path
+                        ));
+                    }
+                }
+            }
             continue;
         }
         summary.cloud_pending_files += 1;
@@ -312,7 +361,6 @@ pub fn backup_once_with_drive(
                     continue;
                 }
             };
-        let cloud_state = store.destination_state(file.file_id, "drive")?;
         let existing_drive_file_id = cloud_state
             .as_ref()
             .and_then(|state| state.target_file_id.as_deref());
@@ -397,8 +445,8 @@ pub fn backup_once_with_drive(
                     "size_only"
                 };
                 let checksum_info = format!(
-                    "blake3={content_hash};md5={};size={size_bytes};verified={verified}",
-                    upload.md5_checksum
+                    "blake3={content_hash};md5={};size={size_bytes};verified={verified};{DRIVE_LAYOUT_V1_MARKER}",
+                    upload.md5_checksum,
                 );
                 match store.commit_drive_upload_if_current(
                     &job_id,

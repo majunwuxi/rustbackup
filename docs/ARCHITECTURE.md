@@ -29,6 +29,7 @@
 - 桌面构建通过 `RUSTBACKUP_GOOGLE_OAUTH_CLIENT_ID` 与 `RUSTBACKUP_GOOGLE_OAUTH_CLIENT_SECRET` 配置 OAuth Desktop 客户端；`RUSTBACKUP_GOOGLE_OAUTH_ENVIRONMENT=production` 才显示为正式环境，默认仍为测试环境。Google 将已安装应用视为无法保守客户端密钥的公开客户端，不得把它当作用户密码或防滥用边界；它可以包含在发行二进制中，但不应提交到源代码或构建日志。未预置客户端密钥的开发构建可由开发者在 UI 输入并保存到 Windows Credential Manager。refresh token 与 resumable session URI 始终保存在 Windows Credential Manager，禁止进入 JSON、SQLite 和日志。访问令牌只驻留内存；无有效授权时返回 `waiting_auth`。
 - 优先受限 `drive.file` scope。首版由应用自己创建专用目录，不保证可浏览任意现有 Drive 目录。
 - Drive 允许同名文件，必须持久化 ID；目录路径到 ID 映射防重复；首次执行前校验绑定账号与文件夹。
+- 云端当前文件按源相对路径映射为任务目录下的应用托管子目录；每级目录以私有 `appProperties` 标记并复用稳定 ID，文件名仅使用路径末段。升级后会在后续任务运行时将已提交的扁平文件迁入对应目录，不重新上传内容；只移动带有匹配任务/文件标记且位于应用托管目录中的当前文件。历史副本仍集中放在 `.RustBackupHistory`。
 - 支持指数退避、Retry-After、配额/403/429/5xx 分类；离线入队；使用有效期内 resumable session，过期重建。
 - 上传完整性比较：本地 BLAKE3 仅作本地索引；可使用 Drive 提供的适用校验元数据（例如二进制文件的 md5Checksum）或下载验证。不能把 BLAKE3 与 Drive MD5 直接比较。云端未可验证则报告校验范围而非假定强验证。
 - 对未完成或失败上传保留旧云端有效版本；任务重试应具备幂等控制或操作后对账。
