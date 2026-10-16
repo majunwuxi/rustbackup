@@ -33,6 +33,8 @@ Windows 上进行真实 Drive API 冒烟验收：`cargo run -p rustbackup-deskto
 - [x] 2026-10-15 M4 隔离 Agent 运行冒烟：Release Agent 使用 `%TEMP%\RustBackup-M4-Agent-269c232e99c345fdb9e9f3743ce8f382` 下临时 APPDATA/LOCALAPPDATA 启动；默认任务保持关闭且源路径为空。状态为 `Idle`、活动任务数为 0；第二实例退出码 0，原实例仍在线；随后已停止测试进程。临时 profile 仅含测试配置、SQLite 状态与日志。
 - [ ] Windows 多进程人工验收：使用另一个 Windows 用户账号及另一台主机分别确认 Named Pipe 连接被拒绝。本机名 UNC 路径和匿名 token 拒绝已通过隔离冒烟验证；同用户单实例和状态查询已通过。
 - [x] 2026-10-15 M4 Windows 发布构建：`cargo tauri build --bundles nsis` 成功生成 x64 current-user 安装包；构建前钩子会构建并暂存独立 Agent sidecar。
+- [x] 2026-10-16 NSIS 更新安装修复：安装前使用 Tauri NSIS 的当前用户进程检查关闭 RustBackup UI 和后台 Agent，避免覆盖运行中的 `rustbackup-agent.exe`；`scripts/package-windows.ps1` 已成功生成 `RustBackup_0.1.2_x64-setup.exe`。
+- [ ] 人工验收：在 Agent 正运行时启动 `0.1.2` 安装包，确认安装器提示关闭进程并完成覆盖更新。
 - [x] M4 前端静态检查：`node --check apps/desktop/ui/app.js`。
 - [ ] 路径嵌套、junction、symlink 和目录循环被安全阻止。
 - [ ] `bidirectional` 报 UnsupportedMode，不能误作 dual。
