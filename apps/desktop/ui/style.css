@@ -63,7 +63,11 @@ h1 {
   letter-spacing: -0.03em;
 }
 
-.environment {
+.account-badge {
+  max-width: min(360px, 40vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   padding: 7px 11px;
   border: 1px solid #cbd8ed;
   border-radius: 999px;
@@ -71,6 +75,24 @@ h1 {
   background: #edf4ff;
   font-size: 12px;
   font-weight: 600;
+}
+
+.account-badge.connected {
+  border-color: #b8dfc7;
+  color: #17633f;
+  background: #eaf7ef;
+}
+
+.account-badge.disconnected {
+  border-color: #cbd8ed;
+  color: #536276;
+  background: #f4f7fb;
+}
+
+.account-badge.unknown {
+  border-color: #efc4be;
+  color: #9a3b2e;
+  background: #fff1ef;
 }
 
 .agent-status {
@@ -214,6 +236,8 @@ h1 {
 .dialog-heading { margin-bottom: 4px; }
 .dialog-heading h2 { margin-bottom: 0; }
 .editor-dialog label { display: grid; gap: 7px; font-size: 13px; font-weight: 650; }
+.drive-folder-field { display: grid; gap: 6px; }
+.field-help { margin: 0; color: #697789; font-size: 12px; line-height: 1.5; }
 .editor-dialog input,
 .editor-dialog select,
 .editor-dialog textarea,

@@ -167,7 +167,7 @@ fn create_backup_task() -> Result<BackupTask, String> {
         .account_id
         .clone();
     task.destinations.google_drive.folder_id = None;
-    task.destinations.google_drive.folder_name = format!("RustBackup/{}", task.id);
+    task.destinations.google_drive.folder_name = format!("RustBackup/{}", task.name);
     config.tasks.push(task.clone());
     validate_config(&config).map_err(config_error_text)?;
     save_config_atomic(&config_path, &config).map_err(config_error_text)?;
@@ -185,6 +185,9 @@ fn save_backup_task(task: BackupTask) -> Result<(), String> {
     if task.enabled != existing.enabled {
         return Err("请使用单独的启用、暂停或恢复操作更改任务状态".to_owned());
     }
+    if task.destinations.google_drive.enabled {
+        validate_drive_folder_name(&task.destinations.google_drive.folder_name)?;
+    }
     if existing.destinations.google_drive.account_id != task.destinations.google_drive.account_id
         || existing.destinations.google_drive.folder_id != task.destinations.google_drive.folder_id
     {
@@ -194,6 +197,26 @@ fn save_backup_task(task: BackupTask) -> Result<(), String> {
     config.tasks.push(task);
     validate_config(&config).map_err(config_error_text)?;
     save_config_atomic(&config_path, &config).map_err(config_error_text)
+}
+
+fn validate_drive_folder_name(folder_name: &str) -> Result<(), String> {
+    let Some(name) = folder_name.strip_prefix("RustBackup/") else {
+        return Err("Google Drive 目标必须位于 RustBackup 文件夹内。".to_owned());
+    };
+    if name.is_empty()
+        || name.trim() != name
+        || name.chars().count() > 100
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.chars().any(char::is_control)
+    {
+        return Err(
+            "Google Drive 子文件夹名称无效；请使用不超过 100 个字符的单层目录名。".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1112,6 +1135,16 @@ mod tests {
             app_data.join("RustBackup").join("config.json")
         );
         assert!(user_config_path_in(Path::new("")).is_err());
+    }
+
+    #[test]
+    fn drive_folder_name_accepts_one_child_and_rejects_paths() {
+        assert!(validate_drive_folder_name("RustBackup/工作资料").is_ok());
+        assert!(validate_drive_folder_name("RustBackup/").is_err());
+        assert!(validate_drive_folder_name("RustBackup/Work/2026").is_err());
+        assert!(validate_drive_folder_name("OtherRoot/Work").is_err());
+        assert!(validate_drive_folder_name("RustBackup/..").is_err());
+        assert!(validate_drive_folder_name(&format!("RustBackup/{}", "x".repeat(101))).is_err());
     }
 
     #[test]

@@ -16,7 +16,7 @@
           <h1>备份管理</h1>
         </div>
         <div class="header-badges">
-          <span id="environment" class="environment">测试环境</span>
+          <span id="cloud-account" class="account-badge disconnected" role="status" aria-live="polite">Google Drive 未连接</span>
           <span id="agent-status" class="agent-status" role="status" aria-live="polite">正在检测 Agent…</span>
         </div>
       </header>
@@ -128,6 +128,10 @@
           <label>本地目标目录
             <div class="path-control"><input id="task-destination" readonly /><button id="choose-destination" class="secondary" type="button">选择目录</button></div>
           </label>
+          <div id="drive-folder-field" class="drive-folder-field" hidden>
+            <label for="task-drive-folder">Google Drive 目标子文件夹<input id="task-drive-folder" maxlength="100" autocomplete="off" placeholder="例如：工作资料" /></label>
+            <p class="field-help">程序会将备份写入 Google Drive 的“RustBackup/此处填写的名称”。首次云端备份时创建；修改名称会重命名该任务由程序管理的目录。</p>
+          </div>
           <div class="form-grid">
             <label>运行方式<select id="task-schedule"><option value="realtime">实时监听</option><option value="hourly">按间隔扫描</option><option value="daily">每日扫描</option><option value="manual">手动扫描</option></select></label>
             <label>扫描间隔（分钟）<input id="task-interval" type="number" min="1" max="10080" /></label>

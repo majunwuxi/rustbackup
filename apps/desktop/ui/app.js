@@ -3,7 +3,7 @@ const invoke = tauri.core.invoke;
 const connection = document.querySelector("#connection");
 const connectButton = document.querySelector("#connect");
 const accountMessage = document.querySelector("#message");
-const environment = document.querySelector("#environment");
+const cloudAccountBadge = document.querySelector("#cloud-account");
 const agentStatus = document.querySelector("#agent-status");
 const secretSetup = document.querySelector("#secret-setup");
 const clientSecretInput = document.querySelector("#client-secret");
@@ -15,6 +15,7 @@ const historyMessage = document.querySelector("#history-message");
 const taskEditor = document.querySelector("#task-editor");
 const taskForm = document.querySelector("#task-form");
 const editorMessage = document.querySelector("#editor-message");
+const driveFolderField = document.querySelector("#drive-folder-field");
 const logList = document.querySelector("#log-list");
 const settingsMessage = document.querySelector("#settings-message");
 let clientSecretConfigured = false;
@@ -41,8 +42,21 @@ function formatDate(value) {
   return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
 }
 
+function setCloudAccountBadge(connected, email, unknown = false) {
+  cloudAccountBadge.classList.toggle("connected", connected);
+  cloudAccountBadge.classList.toggle("disconnected", !connected && !unknown);
+  cloudAccountBadge.classList.toggle("unknown", unknown);
+  cloudAccountBadge.textContent = unknown
+    ? "Google Drive 状态不可用"
+    : connected
+      ? (email || "Google Drive 已连接")
+      : "Google Drive 未连接";
+  cloudAccountBadge.title = connected && email ? `已连接 Google 账户：${email}` : cloudAccountBadge.textContent;
+}
+
 function showConnected(email) {
   accountConnected = true;
+  setCloudAccountBadge(true, email);
   connection.classList.add("connected");
   connection.textContent = email ? `已连接 Google 账户：${email}` : "已连接 Google 账户";
   connectButton.disabled = !clientSecretConfigured;
@@ -52,19 +66,20 @@ function showConnected(email) {
 async function refreshAccountStatus() {
   try {
     const status = await invoke("google_drive_connection_status");
-    environment.textContent = status.test_environment ? "测试环境" : "正式环境";
     clientSecretConfigured = status.client_secret_configured;
     secretSetup.hidden = clientSecretConfigured;
     if (status.connected) {
       showConnected(status.email);
     } else {
       accountConnected = false;
+      setCloudAccountBadge(false);
       connection.classList.remove("connected");
       connection.textContent = "尚未连接 Google 账户";
       connectButton.disabled = !clientSecretConfigured;
       connectButton.textContent = clientSecretConfigured ? "连接 Google Drive" : "请先安全保存客户端密钥";
     }
   } catch (error) {
+    setCloudAccountBadge(false, null, true);
     connection.textContent = "无法读取 RustBackup 授权状态";
     setMessage(accountMessage, String(error));
   }
@@ -104,6 +119,18 @@ function modeLabel(task) {
   return names[task.mode] || task.mode;
 }
 
+function driveFolderName(task) {
+  const parts = (task.destinations.google_drive.folder_name || "")
+    .split(/[\\/]/)
+    .filter(Boolean);
+  return parts[parts.length - 1] || task.name;
+}
+
+function updateDriveFolderVisibility() {
+  const mode = document.querySelector("#task-mode").value;
+  driveFolderField.hidden = mode !== "cloud" && mode !== "dual";
+}
+
 function appendButton(parent, label, className, onClick, disabled = false) {
   const button = element("button", className, label);
   button.type = "button";
@@ -132,6 +159,9 @@ function renderTasks() {
     card.append(element("p", "task-path", `源：${view.task.source.path || "尚未选择"}`));
     if (view.task.destinations.local.enabled) {
       card.append(element("p", "task-path", `本地目标：${view.task.destinations.local.path}`));
+    }
+    if (view.task.destinations.google_drive.enabled) {
+      card.append(element("p", "task-path", `云端目标：我的云端硬盘 / RustBackup / ${driveFolderName(view.task)}`));
     }
     const latest = view.recent_runs[0];
     const detail = latest
@@ -174,6 +204,8 @@ function openEditor(task) {
   document.querySelector("#task-source").value = task.source.path || "";
   document.querySelector("#task-destination").value = task.destinations.local.path || "";
   document.querySelector("#task-mode").value = task.mode;
+  document.querySelector("#task-drive-folder").value = driveFolderName(task);
+  updateDriveFolderVisibility();
   document.querySelector("#task-schedule").value = task.schedule.type;
   document.querySelector("#task-interval").value = task.schedule.reconcile_interval_minutes;
   document.querySelector("#task-excludes").value = task.filters.exclude.join("\n");
@@ -186,7 +218,7 @@ async function toggleTask(view) {
   if (enabling) {
     const task = view.task;
     const cloudNotice = task.destinations.google_drive.enabled
-      ? "\nGoogle Drive 目标也会在授权有效时接收备份文件。"
+      ? `\nGoogle Drive 目标：我的云端硬盘 / RustBackup / ${driveFolderName(task)}`
       : "";
     const localNotice = task.destinations.local.enabled
       ? `\n确认后可能创建本地目标目录：${task.destinations.local.path}`
@@ -353,6 +385,7 @@ document.querySelector("#choose-destination").addEventListener("click", async ()
 
 document.querySelector("#close-editor").addEventListener("click", () => taskEditor.close());
 document.querySelector("#cancel-editor").addEventListener("click", () => taskEditor.close());
+document.querySelector("#task-mode").addEventListener("change", updateDriveFolderVisibility);
 
 taskForm.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -364,6 +397,14 @@ taskForm.addEventListener("submit", async (event) => {
   task.mode = document.querySelector("#task-mode").value;
   task.destinations.local.enabled = task.mode === "local" || task.mode === "dual";
   task.destinations.google_drive.enabled = task.mode === "cloud" || task.mode === "dual";
+  if (task.destinations.google_drive.enabled) {
+    const driveFolder = document.querySelector("#task-drive-folder").value.trim();
+    if (!driveFolder || [...driveFolder].length > 100 || driveFolder === "." || driveFolder === ".." || /[\\/\u0000-\u001f\u007f]/u.test(driveFolder)) {
+      setMessage(editorMessage, "请输入有效的 Google Drive 子文件夹名称（最多 100 个字符，不能包含斜杠）。");
+      return;
+    }
+    task.destinations.google_drive.folder_name = `RustBackup/${driveFolder}`;
+  }
   task.schedule.type = document.querySelector("#task-schedule").value;
   task.schedule.reconcile_interval_minutes = Number(document.querySelector("#task-interval").value);
   task.schedule.scan_on_startup = true;
@@ -428,6 +469,7 @@ connectButton.addEventListener("click", async () => {
   const reauthorizing = accountConnected;
   if (reauthorizing) {
     accountConnected = false;
+    setCloudAccountBadge(false);
     connection.classList.remove("connected");
     connection.textContent = "正在清除此设备的登录状态…";
   }

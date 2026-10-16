@@ -741,7 +741,31 @@ impl DriveClient {
             {
                 return Err(DriveError::InvalidResponse);
             }
-            return Ok(folder);
+            if folder.name == name {
+                return Ok(folder);
+            }
+
+            let url = format!(
+                "{}/files/{}?fields=id,name,mimeType,appProperties,parents",
+                self.api_root(),
+                encode_path_segment(&folder.id)
+            );
+            let body = serde_json::json!({ "name": name });
+            let renamed: DriveFile = self.api_json("PATCH", &url, Some(&body))?;
+            validate_remote_file(&renamed)?;
+            let expected_role = format!("folder:{role}");
+            if renamed.id != folder.id
+                || renamed.name != name
+                || renamed.mime_type != FOLDER_MIME_TYPE
+                || renamed.app_properties.get("rb_task").map(String::as_str) != Some(task_id)
+                || renamed.app_properties.get("rb_role").map(String::as_str)
+                    != Some(expected_role.as_str())
+                || parent_id
+                    .is_some_and(|parent| !renamed.parents.iter().any(|value| value == parent))
+            {
+                return Err(DriveError::InvalidResponse);
+            }
+            return Ok(renamed);
         }
         let mut properties = BTreeMap::new();
         properties.insert("rb_task".to_owned(), task_id.to_owned());
@@ -1668,6 +1692,94 @@ mod tests {
         assert_eq!(folders.root_id, "root-folder");
         assert_eq!(folders.task_id, "task-folder");
         assert_eq!(folders.history_id, "history-folder");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn ensure_task_folders_renames_managed_directory_and_keeps_folder_ids() {
+        let (endpoints, server) = mock_server(10, |index, request| match index {
+            0..=5 if request.method == "GET" => {
+                MockResponse::json(200, serde_json::json!({"files": []}))
+            }
+            0..=5 => {
+                assert_eq!(request.method, "POST");
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let role = body["appProperties"]["rb_role"].as_str().unwrap();
+                let id = match role {
+                    "folder:root" => "root-folder",
+                    "folder:task" => "task-folder",
+                    "folder:history" => "history-folder",
+                    _ => panic!("unexpected folder role"),
+                };
+                let mut response = serde_json::json!({
+                    "id": id,
+                    "name": body["name"],
+                    "mimeType": FOLDER_MIME_TYPE,
+                    "appProperties": body["appProperties"],
+                });
+                if let Some(parents) = body.get("parents") {
+                    response["parents"] = parents.clone();
+                }
+                MockResponse::json(200, response)
+            }
+            6 => MockResponse::json(
+                200,
+                serde_json::json!({"files": [{
+                    "id": "root-folder",
+                    "name": "RustBackup",
+                    "mimeType": FOLDER_MIME_TYPE,
+                    "appProperties": {"rb_task": "__rustbackup__", "rb_role": "folder:root"}
+                }]}),
+            ),
+            7 => MockResponse::json(
+                200,
+                serde_json::json!({"files": [{
+                    "id": "task-folder",
+                    "name": "Work",
+                    "mimeType": FOLDER_MIME_TYPE,
+                    "appProperties": {"rb_task": "work-documents", "rb_role": "folder:task"},
+                    "parents": ["root-folder"]
+                }]}),
+            ),
+            8 => {
+                assert_eq!(request.method, "PATCH");
+                assert!(request.target.starts_with("/drive/v3/files/task-folder?"));
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["name"], "Archive");
+                MockResponse::json(
+                    200,
+                    serde_json::json!({
+                        "id": "task-folder",
+                        "name": "Archive",
+                        "mimeType": FOLDER_MIME_TYPE,
+                        "appProperties": {"rb_task": "work-documents", "rb_role": "folder:task"},
+                        "parents": ["root-folder"]
+                    }),
+                )
+            }
+            9 => MockResponse::json(
+                200,
+                serde_json::json!({"files": [{
+                    "id": "history-folder",
+                    "name": ".RustBackupHistory",
+                    "mimeType": FOLDER_MIME_TYPE,
+                    "appProperties": {"rb_task": "work-documents", "rb_role": "folder:history"},
+                    "parents": ["task-folder"]
+                }]}),
+            ),
+            _ => panic!("unexpected Drive request"),
+        });
+
+        let client = test_client(endpoints, Arc::new(MemoryCredentials::default()));
+        let first = client
+            .ensure_task_folders("work-documents", "RustBackup/Work")
+            .unwrap();
+        let renamed = client
+            .ensure_task_folders("work-documents", "RustBackup/Archive")
+            .unwrap();
+
+        assert_eq!(first, renamed);
+        assert_eq!(renamed.task_id, "task-folder");
         server.join().unwrap();
     }
 
