@@ -29,6 +29,8 @@ const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_REPORTED_ISSUES: usize = 100;
 const DRIVE_HISTORY_GC_BATCH: usize = 256;
 const DRIVE_HISTORY_GC_LEASE_MS: i64 = 30 * 60 * 1_000;
+const BACKUP_PROGRESS_FILE_BATCH: u64 = 25;
+const BACKUP_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 
 trait DriveHistoryDeleter {
     fn delete_history_version(
@@ -178,7 +180,7 @@ pub fn backup_once(
             } else {
                 BackupRunStatus::Error
             };
-            store.finish_backup_run(&run_id, status, 0, 0, Some(&error.to_string()))?;
+            store.fail_backup_run(&run_id, status, &error.to_string())?;
             Err(error)
         }
     }
@@ -649,6 +651,8 @@ fn run_reconciliation(
     };
     let filters = FilterSet::new(&task.filters).map_err(ScanError::from)?;
     let mut scan_complete = true;
+    let mut last_progress_update = Instant::now();
+    let mut last_persisted_scanned_files = 0;
 
     for item in scanner {
         let scanned = match item {
@@ -656,10 +660,24 @@ fn run_reconciliation(
             Err(error) => {
                 scan_complete = false;
                 summary.add_issue(error.to_string());
+                update_backup_progress_if_due(
+                    store,
+                    &summary,
+                    &mut last_progress_update,
+                    &mut last_persisted_scanned_files,
+                    false,
+                )?;
                 continue;
             }
         };
         summary.scanned_files += 1;
+        update_backup_progress_if_due(
+            store,
+            &summary,
+            &mut last_progress_update,
+            &mut last_persisted_scanned_files,
+            false,
+        )?;
         let display_path = scanned.relative_path.to_string_lossy().into_owned();
         let previous = store.indexed_file_state(&task.id, &scanned.relative_path_key)?;
         let indexed = match store.record_file_seen(
@@ -677,6 +695,13 @@ fn run_reconciliation(
             Err(error) => {
                 scan_complete = false;
                 summary.add_issue(error.to_string());
+                update_backup_progress_if_due(
+                    store,
+                    &summary,
+                    &mut last_progress_update,
+                    &mut last_persisted_scanned_files,
+                    false,
+                )?;
                 continue;
             }
         };
@@ -745,7 +770,22 @@ fn run_reconciliation(
                 summary.add_issue(format!("{}: {message}", display_path));
             }
         }
+        update_backup_progress_if_due(
+            store,
+            &summary,
+            &mut last_progress_update,
+            &mut last_persisted_scanned_files,
+            false,
+        )?;
     }
+
+    update_backup_progress_if_due(
+        store,
+        &summary,
+        &mut last_progress_update,
+        &mut last_persisted_scanned_files,
+        true,
+    )?;
 
     if scan_complete {
         let unseen = store.unseen_files(&task.id, &run_id)?;
@@ -801,6 +841,31 @@ fn run_reconciliation(
     }
 
     Ok(summary)
+}
+
+fn update_backup_progress_if_due(
+    store: &StateStore,
+    summary: &BackupSummary,
+    last_progress_update: &mut Instant,
+    last_persisted_scanned_files: &mut u64,
+    force: bool,
+) -> Result<(), StorageError> {
+    if force
+        || summary
+            .scanned_files
+            .saturating_sub(*last_persisted_scanned_files)
+            >= BACKUP_PROGRESS_FILE_BATCH
+        || last_progress_update.elapsed() >= BACKUP_PROGRESS_INTERVAL
+    {
+        store.update_backup_run_progress(
+            &summary.run_id,
+            summary.scanned_files,
+            summary.copied_files,
+        )?;
+        *last_progress_update = Instant::now();
+        *last_persisted_scanned_files = summary.scanned_files;
+    }
+    Ok(())
 }
 
 fn copy_scanned_file(

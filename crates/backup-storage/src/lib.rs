@@ -387,6 +387,44 @@ impl StateStore {
         Ok(run_id)
     }
 
+    pub fn update_backup_run_progress(
+        &self,
+        run_id: &str,
+        scanned_files: u64,
+        changed_files: u64,
+    ) -> Result<(), StorageError> {
+        let scanned_files =
+            i64::try_from(scanned_files).map_err(|_| StorageError::CountOverflow)?;
+        let changed_files =
+            i64::try_from(changed_files).map_err(|_| StorageError::CountOverflow)?;
+        let updated = self.connection.execute(
+            "UPDATE backup_runs SET scanned_files=?2,changed_files=?3 \
+             WHERE run_id=?1 AND status='running'",
+            params![run_id, scanned_files, changed_files],
+        )?;
+        if updated == 0 {
+            return Err(StorageError::MissingRun(run_id.to_owned()));
+        }
+        Ok(())
+    }
+
+    pub fn fail_backup_run(
+        &self,
+        run_id: &str,
+        status: BackupRunStatus,
+        error_summary: &str,
+    ) -> Result<(), StorageError> {
+        let updated = self.connection.execute(
+            "UPDATE backup_runs SET finished_at=datetime('now'),status=?2,error_summary=?3 \
+             WHERE run_id=?1",
+            params![run_id, status.as_str(), error_summary],
+        )?;
+        if updated == 0 {
+            return Err(StorageError::MissingRun(run_id.to_owned()));
+        }
+        Ok(())
+    }
+
     pub fn finish_backup_run(
         &self,
         run_id: &str,
@@ -2417,6 +2455,28 @@ mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(table_count, 12);
+    }
+
+    #[test]
+    fn backup_run_progress_is_visible_while_running_and_kept_on_failure() {
+        let store = new_store();
+        store.register_task("task", "test", true).unwrap();
+        let run = store.begin_backup_run("task").unwrap();
+
+        store.update_backup_run_progress(&run, 27, 4).unwrap();
+        let running = store.recent_backup_runs("task", 1).unwrap().remove(0);
+        assert_eq!(running.status, "running");
+        assert_eq!(running.scanned_files, 27);
+        assert_eq!(running.changed_files, 4);
+
+        store
+            .fail_backup_run(&run, BackupRunStatus::Error, "test failure")
+            .unwrap();
+        let failed = store.recent_backup_runs("task", 1).unwrap().remove(0);
+        assert_eq!(failed.status, "error");
+        assert_eq!(failed.scanned_files, 27);
+        assert_eq!(failed.changed_files, 4);
+        assert_eq!(failed.error_summary.as_deref(), Some("test failure"));
     }
 
     #[test]

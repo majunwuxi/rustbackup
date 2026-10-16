@@ -164,8 +164,10 @@ function renderTasks() {
       card.append(element("p", "task-path", `云端目标：我的云端硬盘 / RustBackup / ${driveFolderName(view.task)}`));
     }
     const latest = view.recent_runs[0];
+    const runLabel = latest?.status === "running" ? "当前进度" : "最近一次";
+    const runStatus = latest?.status === "running" ? "正在备份" : latest?.status;
     const detail = latest
-      ? `最近一次：${latest.status} · 扫描 ${latest.scanned_files} 个文件 · 变更 ${latest.changed_files} 个 · ${formatDate(latest.started_at)}`
+      ? `${runLabel}：${runStatus} · 已扫描 ${latest.scanned_files} 个文件 · 已复制 ${latest.changed_files} 个 · ${formatDate(latest.started_at)}`
       : "尚无备份记录";
     card.append(element("p", "task-summary", `${modeLabel(view.task)} · ${view.task.schedule.type} · ${detail}`));
     if (latest?.error_summary) card.append(element("p", "task-path", latest.error_summary));
@@ -495,10 +497,16 @@ connectButton.addEventListener("click", async () => {
 
 async function initialize() {
   await Promise.all([refreshAccountStatus(), refreshTasks(), refreshSettings(), refreshAgentStatus()]);
-  window.setInterval(async () => {
+  const refreshPeriodically = async () => {
     await refreshAgentStatus();
     if (!taskEditor.open) await refreshTasks();
-  }, 5000);
+    const activeRun = tasks.some((view) =>
+      view.recent_runs[0]?.status === "running"
+      || view.manual_runs.some((run) => run.status === "queued" || run.status === "running"),
+    );
+    window.setTimeout(refreshPeriodically, taskEditor.open || !activeRun ? 5000 : 1000);
+  };
+  window.setTimeout(refreshPeriodically, 5000);
 }
 
 initialize();

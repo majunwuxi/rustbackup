@@ -35,6 +35,9 @@ Windows 上进行真实 Drive API 冒烟验收：`cargo run -p rustbackup-deskto
 - [x] 2026-10-15 M4 Windows 发布构建：`cargo tauri build --bundles nsis` 成功生成 x64 current-user 安装包；构建前钩子会构建并暂存独立 Agent sidecar。
 - [x] 2026-10-16 NSIS 更新安装修复：安装前使用 Tauri NSIS 的当前用户进程检查关闭 RustBackup UI 和后台 Agent，避免覆盖运行中的 `rustbackup-agent.exe`；`scripts/package-windows.ps1` 已成功生成 `RustBackup_0.1.2_x64-setup.exe`。
 - [ ] 人工验收：在 Agent 正运行时启动 `0.1.2` 安装包，确认安装器提示关闭进程并完成覆盖更新。
+- [x] 2026-10-16 桌面发布版隐藏控制台窗口；备份运行中的扫描/复制计数定期写入 SQLite，UI 在有活动备份时每秒刷新，失败运行保留已完成的计数。
+- [x] 2026-10-16 `0.1.3` Windows 安装包构建成功；对发布桌面 EXE 的 PE 头检查确认子系统为 Windows GUI（2）。
+- [ ] 人工验收：运行 `0.1.3` 后确认不再出现控制台；启动多文件任务时确认扫描数逐步增加，复制数只在文件完成备份后增加。
 - [x] M4 前端静态检查：`node --check apps/desktop/ui/app.js`。
 - [ ] 路径嵌套、junction、symlink 和目录循环被安全阻止。
 - [ ] `bidirectional` 报 UnsupportedMode，不能误作 dual。
